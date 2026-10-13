@@ -11,6 +11,8 @@ python3 tests/test_narration_entry.py
 python3 tests/run_synthetic.py
 python3 tests/test_setup_displays.py
 python3 tests/test_floating_chrome.py
+python3 tests/test_standalone_prompter.py
+python3 tests/test_standalone_ui.py
 ```
 
 Each runner reads `skills/blurt/recorder/macos/BlurtRecorder.swift`. Use `--source`
@@ -24,6 +26,14 @@ they do not add a macOS dependency to Linux smoke-test discovery.
 
 ## Coverage
 
+- `test_standalone_prompter.py` exercises the real standalone entry and lifecycle,
+  editing, hidden settings/panel recovery, independent visibility preferences,
+  display selection, transitions to/from narration, all feedback-recording
+  entry points, busy-state guards, preferred-mode reopening, and teardown. It
+  rejects session-directory creation and removes capture/microphone boundaries.
+- `test_standalone_ui.py` checks the independent editor in Chinese and English,
+  including live updates, immediate draft flush on close, display selection,
+  control bounds, transparent corners, and the preparation-only mode switch.
 - `test_narration_entry.py` uses the production menu, preview, setup, selection,
   start, restart, and finish callbacks. It checks preview gating, draft retention,
   recording-time editing, prompter toggles, and cancellation. With two attached

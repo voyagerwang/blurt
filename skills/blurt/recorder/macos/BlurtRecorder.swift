@@ -866,6 +866,10 @@ private final class NarrationSetupWindow: NSWindow {
 }
 
 private final class NarrationSetupDragView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let hit = super.hitTest(point) else { return nil }
+        return hit is NSTextField ? self : hit
+    }
     override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
 }
 
@@ -878,6 +882,8 @@ private final class NarrationPreviewImageView: NSImageView {
 
 // The menu-bar app has no Edit menu. Preserve ordinary multiline-editor shortcuts.
 private final class NarrationScriptTextView: NSTextView {
+    var placeholder = L("在这里输入或粘贴讲解内容…\n\n可以先看画面，再慢慢准备。关闭提词器也会保留草稿。",
+                        "Type or paste your script here…\n\nCheck your frame, then prepare your words. Turning the teleprompter off keeps your draft.")
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         guard flags.contains(.command), !flags.contains(.option), !flags.contains(.control) else {
@@ -897,11 +903,9 @@ private final class NarrationScriptTextView: NSTextView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         guard string.isEmpty else { return }
-        let text = L("在这里输入或粘贴讲解内容…\n\n可以先看画面，再慢慢准备。关闭提词器也会保留草稿。",
-                     "Type or paste your script here…\n\nCheck your frame, then prepare your words. Turning the teleprompter off keeps your draft.")
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineSpacing = 5
-        (text as NSString).draw(in: NSRect(x: textContainerInset.width + 5, y: textContainerInset.height,
+        (placeholder as NSString).draw(in: NSRect(x: textContainerInset.width + 5, y: textContainerInset.height,
                                          width: max(40, bounds.width - textContainerInset.width * 2 - 10), height: 180),
                                withAttributes: [.font: font ?? NSFont.systemFont(ofSize: 15),
                                                 .foregroundColor: NSColor(white: 1, alpha: 0.34),
@@ -946,6 +950,7 @@ final class NarrationSetupController: NSObject, NSWindowDelegate, NSTextViewDele
     var onRetryPreview: (() -> Void)?
     var onFinish: (() -> Void)?
     var onHide: (() -> Void)?
+    var onUseStandalone: (() -> Void)?
 
     var scriptValue: String { editor?.string ?? savedScript }
     private(set) var prompterEnabled: Bool
@@ -981,6 +986,7 @@ final class NarrationSetupController: NSObject, NSWindowDelegate, NSTextViewDele
     private var cancelButton: PillButton?
     private var chooseRegionButton: PillButton?
     private var fullScreenButton: PillButton?
+    private var standaloneButton: PillButton?
     private var recordingDisplaySelector: NarrationDisplaySelector?
     private var prompterDisplaySelector: NarrationDisplaySelector?
 
@@ -1068,6 +1074,8 @@ final class NarrationSetupController: NSObject, NSWindowDelegate, NSTextViewDele
         }
         microphoneSwitch?.isEnabled = !recording
         microphoneSwitch?.alphaValue = recording ? 0.35 : 1
+        standaloneButton?.isHidden = recording
+        standaloneButton?.isEnabled = !recording
         recordingDisplaySelector?.isEnabled = !recording && !displayOptions.isEmpty
         recordingDisplaySelector?.needsDisplay = true
         cancelButton?.title = recording ? L("返回录制", "Back") : L("取消", "Cancel")
@@ -1286,6 +1294,9 @@ final class NarrationSetupController: NSObject, NSWindowDelegate, NSTextViewDele
         add(microphone)
         microphoneSwitch = microphone
         let saveHint = label(L("完成后保存为 MP4", "Save as MP4 when finished"), size: 12, alpha: 0.45)
+        let standalone = button(L("仅用提词器", "Teleprompter only"), symbol: "text.bubble", selector: #selector(useStandalone))
+        standalone.setAccessibilityLabel(L("切换为独立提词器", "Use the teleprompter on its own"))
+        standaloneButton = standalone
         let cancelButton = button(L("取消", "Cancel"), selector: #selector(cancel))
         self.cancelButton = cancelButton
         cancelButton.keyEquivalent = "\u{1b}"
@@ -1356,6 +1367,8 @@ final class NarrationSetupController: NSObject, NSWindowDelegate, NSTextViewDele
             microphone.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 23), microphone.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
             microphone.widthAnchor.constraint(equalToConstant: 187), microphone.heightAnchor.constraint(equalToConstant: 40),
             saveHint.leadingAnchor.constraint(equalTo: microphone.trailingAnchor, constant: 17), saveHint.centerYAnchor.constraint(equalTo: microphone.centerYAnchor),
+            standalone.leadingAnchor.constraint(equalTo: saveHint.trailingAnchor, constant: 14), standalone.centerYAnchor.constraint(equalTo: microphone.centerYAnchor),
+            standalone.trailingAnchor.constraint(lessThanOrEqualTo: cancelButton.leadingAnchor, constant: -14),
             start.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24), start.centerYAnchor.constraint(equalTo: microphone.centerYAnchor),
             cancelButton.trailingAnchor.constraint(equalTo: start.leadingAnchor, constant: -10), cancelButton.centerYAnchor.constraint(equalTo: start.centerYAnchor)
         ])
@@ -1419,6 +1432,11 @@ final class NarrationSetupController: NSObject, NSWindowDelegate, NSTextViewDele
     @objc private func selectFullScreen() { if !recordingMode { onSelectFullScreen?() } }
     @objc private func retryPreview() { onRetryPreview?() }
     @objc private func togglePrompter() { setPrompterEnabled(!prompterEnabled) }
+    @objc private func useStandalone() {
+        guard !recordingMode, !finished else { return }
+        flushDraft(notify: false)
+        onUseStandalone?()
+    }
     @objc private func toggleMicrophone() {
         guard !recordingMode else { return }
         microphoneEnabled.toggle()
@@ -1459,6 +1477,279 @@ final class NarrationSetupController: NSObject, NSWindowDelegate, NSTextViewDele
     deinit { draftSave?.cancel() }
 }
 
+
+private final class StandalonePrompterWindow: NSWindow {
+    weak var prompterController: StandalonePrompterController?
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+    override func cancelOperation(_ sender: Any?) { prompterController?.hide() }
+}
+
+private final class StandalonePrompterSurfaceView: NSView {
+    override var isOpaque: Bool { false }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor(calibratedRed: 0.105, green: 0.112, blue: 0.125, alpha: 1).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: 22, yRadius: 22).fill()
+    }
+}
+
+/// Script settings for an independent prompter. This controller never starts capture.
+final class StandalonePrompterController: NSObject, NSWindowDelegate, NSTextViewDelegate {
+    var onChange: ((String, Bool) -> Void)?
+    var onSelectDisplay: ((CGDirectDisplayID) -> Void)?
+    var onHide: (() -> Void)?
+
+    var scriptValue: String { editor?.string ?? savedScript }
+    private(set) var prompterEnabled: Bool
+    private var savedScript: String
+    private var displayOptions: [NarrationDisplayOption] = []
+    private var selectedDisplay: CGDirectDisplayID?
+    private var window: StandalonePrompterWindow?
+    private var editor: NarrationScriptTextView?
+    private var displaySelector: NarrationDisplaySelector?
+    private var prompterSwitch: NarrationToggleButton?
+    private var wordCount: NSTextField?
+    private var stateHint: NSTextField?
+    private var draftSave: DispatchWorkItem?
+
+    override init() {
+        let config = recordConfig()
+        savedScript = config["narration_script"] as? String ?? ""
+        prompterEnabled = config["standalone_prompter_enabled"] as? Bool ?? true
+        super.init()
+    }
+
+    func show() {
+        if window == nil { buildWindow() }
+        activateApp()
+        if window?.isMiniaturized == true { window?.deminiaturize(nil) }
+        window?.makeKeyAndOrderFront(nil)
+        if let editor = editor { window?.makeFirstResponder(editor) }
+    }
+
+    /// Keep the independent prompter running while dismissing its settings.
+    @objc func hide() {
+        let wasVisible = window?.isVisible == true
+        flushDraft(notify: true)
+        window?.orderOut(nil)
+        if wasVisible { onHide?() }
+    }
+
+    /// Flush and release settings during a mode switch or application teardown.
+    func close() {
+        flushDraft(notify: true)
+        window?.orderOut(nil)
+        window?.delegate = nil
+        window?.prompterController = nil
+        window = nil
+        editor = nil
+        displaySelector = nil
+        prompterSwitch = nil
+        wordCount = nil
+        stateHint = nil
+    }
+
+    func setDisplayOptions(_ options: [NarrationDisplayOption], selected: CGDirectDisplayID?) {
+        displayOptions = options
+        selectedDisplay = selected
+        displaySelector?.setOptions(options, selected: selected)
+        displaySelector?.isEnabled = !options.isEmpty
+        displaySelector?.needsDisplay = true
+    }
+
+    func setPrompterEnabled(_ enabled: Bool) {
+        prompterEnabled = enabled
+        prompterSwitch?.enabledValue = enabled
+        setRecordConfig("standalone_prompter_enabled", enabled)
+        refreshText()
+        flushDraft(notify: true)
+    }
+
+    private func buildWindow() {
+        let w = StandalonePrompterWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 650),
+                                         styleMask: [.borderless, .resizable], backing: .buffered, defer: false)
+        w.title = L("提词器设置 · Blurt", "Teleprompter settings · Blurt")
+        w.minSize = NSSize(width: 580, height: 520)
+        w.isReleasedWhenClosed = false
+        w.isOpaque = false
+        w.backgroundColor = .clear
+        w.hasShadow = true
+        w.appearance = NSAppearance(named: .darkAqua)
+        w.collectionBehavior = [.moveToActiveSpace]
+        w.sharingType = chromeSharing
+        w.prompterController = self
+        w.delegate = self
+        window = w
+
+        let content = StandalonePrompterSurfaceView(frame: NSRect(origin: .zero, size: w.frame.size))
+        w.contentView = content
+        func add(_ view: NSView, to parent: NSView = content) {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            parent.addSubview(view)
+        }
+        func label(_ value: String, size: CGFloat, weight: NSFont.Weight = .regular,
+                   alpha: CGFloat = 0.9, parent: NSView = content) -> NSTextField {
+            let result = NSTextField(wrappingLabelWithString: value)
+            result.font = .systemFont(ofSize: size, weight: weight)
+            result.textColor = NSColor(white: 1, alpha: alpha)
+            result.isSelectable = false
+            result.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            add(result, to: parent)
+            return result
+        }
+
+        let header = NarrationSetupDragView()
+        add(header)
+        let heading = label(L("提词器", "Teleprompter"), size: 24, weight: .bold, parent: header)
+        let subtitle = label(L("准备好讲稿，按自己的节奏表达。", "Prepare your script and speak at your own pace."),
+                             size: 13, alpha: 0.52, parent: header)
+        let closeButton = IconButton(symbol: "xmark", tip: L("收起提词器设置", "Hide teleprompter settings"),
+                                     target: self, action: #selector(hide))
+        add(closeButton)
+        let toggle = NarrationToggleButton(frame: .zero)
+        toggle.title = L("显示提词器", "Show teleprompter")
+        toggle.symbol = "text.bubble"
+        toggle.isBordered = false
+        toggle.target = self
+        toggle.action = #selector(togglePrompter)
+        toggle.enabledValue = prompterEnabled
+        toggle.setAccessibilityLabel(L("显示或关闭独立提词器", "Show or hide the standalone teleprompter"))
+        add(toggle)
+        prompterSwitch = toggle
+
+        let displayLabel = label(L("提词器屏幕", "Prompter display"), size: 12, weight: .medium, alpha: 0.65)
+        let displays = NarrationDisplaySelector(frame: .zero)
+        displays.setAccessibilityLabel(L("提词器屏幕", "Prompter display"))
+        displays.onSelect = { [weak self] id in
+            self?.selectedDisplay = id
+            self?.onSelectDisplay?(id)
+        }
+        add(displays)
+        displaySelector = displays
+        let scriptLabel = label(L("提词内容", "Your script"), size: 12, weight: .medium, alpha: 0.65)
+        let count = label("", size: 11, alpha: 0.4)
+        count.alignment = .right
+        wordCount = count
+
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+        scroll.borderType = .noBorder
+        scroll.drawsBackground = true
+        scroll.backgroundColor = NSColor(calibratedRed: 0.073, green: 0.078, blue: 0.088, alpha: 1)
+        scroll.contentView.drawsBackground = true
+        scroll.contentView.backgroundColor = scroll.backgroundColor
+        scroll.wantsLayer = true
+        scroll.layer?.cornerRadius = 12
+        scroll.layer?.masksToBounds = true
+        let text = NarrationScriptTextView(frame: NSRect(x: 0, y: 0, width: 620, height: 300))
+        text.placeholder = L("在这里输入或粘贴提词内容…\n\n讲稿会自动保存，也可以在提词时随时修改。",
+                             "Type or paste your script here…\n\nYour draft is saved automatically. You can edit it while using the teleprompter.")
+        text.isRichText = false
+        text.importsGraphics = false
+        text.allowsUndo = true
+        text.isAutomaticQuoteSubstitutionEnabled = false
+        text.isAutomaticDashSubstitutionEnabled = false
+        text.font = .systemFont(ofSize: 17)
+        text.textColor = NSColor(white: 1, alpha: 0.9)
+        text.insertionPointColor = accent
+        text.drawsBackground = true
+        text.backgroundColor = scroll.backgroundColor
+        text.textContainerInset = NSSize(width: 14, height: 16)
+        text.isVerticallyResizable = true
+        text.isHorizontallyResizable = false
+        text.autoresizingMask = .width
+        text.minSize = .zero
+        text.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        text.textContainer?.widthTracksTextView = true
+        text.textContainer?.containerSize = NSSize(width: 592, height: CGFloat.greatestFiniteMagnitude)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 6
+        text.defaultParagraphStyle = paragraph
+        text.string = savedScript
+        text.delegate = self
+        text.setAccessibilityLabel(L("提词内容，草稿自动保存在本机", "Teleprompter script, draft saved on this Mac"))
+        editor = text
+        scroll.documentView = text
+        add(scroll)
+
+        let hint = label("", size: 11, alpha: 0.48)
+        hint.maximumNumberOfLines = 2
+        stateHint = hint
+        let done = PillButton(L("完成设置", "Done"), symbol: "checkmark", fill: accent,
+                              target: self, action: #selector(hide))
+        let doneWidth = done.frame.width
+        add(done)
+        done.setAccessibilityLabel(L("完成设置并保留提词器", "Finish settings and keep the teleprompter"))
+
+        NSLayoutConstraint.activate([
+            header.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 26),
+            header.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -14),
+            header.topAnchor.constraint(equalTo: content.topAnchor, constant: 24),
+            header.heightAnchor.constraint(equalToConstant: 58),
+            heading.leadingAnchor.constraint(equalTo: header.leadingAnchor), heading.topAnchor.constraint(equalTo: header.topAnchor),
+            subtitle.leadingAnchor.constraint(equalTo: header.leadingAnchor), subtitle.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+            subtitle.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 6),
+            closeButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -22),
+            closeButton.topAnchor.constraint(equalTo: content.topAnchor, constant: 23),
+            closeButton.widthAnchor.constraint(equalToConstant: 32), closeButton.heightAnchor.constraint(equalToConstant: 32),
+            toggle.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
+            toggle.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24),
+            toggle.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 16), toggle.heightAnchor.constraint(equalToConstant: 44),
+            displayLabel.leadingAnchor.constraint(equalTo: toggle.leadingAnchor, constant: 2),
+            displayLabel.widthAnchor.constraint(equalToConstant: L("zh", "en") == "zh" ? 90 : 112),
+            displayLabel.centerYAnchor.constraint(equalTo: displays.centerYAnchor),
+            displays.leadingAnchor.constraint(equalTo: displayLabel.trailingAnchor, constant: 10),
+            displays.trailingAnchor.constraint(equalTo: toggle.trailingAnchor),
+            displays.topAnchor.constraint(equalTo: toggle.bottomAnchor, constant: 14), displays.heightAnchor.constraint(equalToConstant: 34),
+            scriptLabel.leadingAnchor.constraint(equalTo: displayLabel.leadingAnchor),
+            scriptLabel.topAnchor.constraint(equalTo: displays.bottomAnchor, constant: 22),
+            count.trailingAnchor.constraint(equalTo: toggle.trailingAnchor, constant: -2), count.centerYAnchor.constraint(equalTo: scriptLabel.centerYAnchor),
+            scroll.leadingAnchor.constraint(equalTo: toggle.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: toggle.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: scriptLabel.bottomAnchor, constant: 10), scroll.bottomAnchor.constraint(equalTo: done.topAnchor, constant: -22),
+            done.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24),
+            done.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -22),
+            done.widthAnchor.constraint(equalToConstant: doneWidth), done.heightAnchor.constraint(equalToConstant: 36),
+            hint.leadingAnchor.constraint(equalTo: toggle.leadingAnchor, constant: 2),
+            hint.trailingAnchor.constraint(lessThanOrEqualTo: done.leadingAnchor, constant: -20), hint.centerYAnchor.constraint(equalTo: done.centerYAnchor)
+        ])
+        content.layoutSubtreeIfNeeded()
+        text.setFrameSize(NSSize(width: scroll.contentSize.width, height: max(scroll.contentSize.height, text.frame.height)))
+        setDisplayOptions(displayOptions, selected: selectedDisplay)
+        refreshText()
+        w.center()
+    }
+
+    func textDidChange(_ notification: Notification) {
+        editor?.needsDisplay = true
+        refreshText()
+        draftSave?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.flushDraft(notify: true) }
+        draftSave = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
+    private func refreshText() {
+        let count = scriptValue.count
+        wordCount?.stringValue = L("\(count) 字", "\(count) characters")
+        stateHint?.stringValue = prompterEnabled
+            ? L("草稿自动保存 · 完成设置后继续提词", "Draft saved automatically · prompting continues after Done")
+            : L("提词器已关闭 · 草稿会保留", "Teleprompter hidden · your draft is kept")
+    }
+
+    private func flushDraft(notify: Bool) {
+        draftSave?.cancel()
+        draftSave = nil
+        savedScript = scriptValue
+        setRecordConfig("narration_script", savedScript)
+        if notify { onChange?(savedScript, prompterEnabled) }
+    }
+
+    @objc private func togglePrompter() { setPrompterEnabled(!prompterEnabled) }
+    func windowShouldClose(_ sender: NSWindow) -> Bool { hide(); return false }
+    deinit { draftSave?.cancel() }
+}
 
 private final class TeleprompterTextView: NSTextView {
     override var acceptsFirstResponder: Bool { false }
@@ -1612,6 +1903,7 @@ final class TeleprompterPanel: NSPanel, NSWindowDelegate {
     private var autoScroll = false
     private var recordingPaused = false
     private var previewMode = true
+    private var standaloneMode = false
     private var reachedEnd = false
     private var showDimensions = false
     private var lastTick: TimeInterval?
@@ -2048,7 +2340,23 @@ final class TeleprompterPanel: NSPanel, NSWindowDelegate {
         lastTick = nil
         refreshStatus()
     }
-    // The owner's preview/HUD timer drives this in both modes. Hidden panels do not advance.
+    func setStandaloneMode(_ enabled: Bool) {
+        standaloneMode = enabled
+        recordingPaused = false
+        lastTick = nil
+        privateLabel.stringValue = enabled
+            ? L("独立提词 · 拖动标题栏", "Standalone · drag header")
+            : L("不录入视频 · 拖动标题栏", "Hidden in video · drag header")
+        setAccessibilityLabel(enabled
+            ? L("独立提词器，可阅读、滚动和编辑讲稿", "Standalone teleprompter for reading, scrolling, and editing scripts")
+            : L("讲解提词器，不会出现在 Blurt 录制的视频里", "Narration teleprompter, excluded from the Blurt recording"))
+        let closeTip = enabled ? L("关闭提词器", "Hide teleprompter")
+                               : L("关闭提词器（录制继续）", "Hide teleprompter (recording continues)")
+        closeButton.toolTip = closeTip
+        closeButton.setAccessibilityLabel(closeTip)
+        refreshStatus()
+    }
+    // The owner's standalone/preview/HUD timer drives scrolling. Hidden panels do not advance.
     func update(paused: Bool) {
         guard !ended else { return }
         let now = ProcessInfo.processInfo.systemUptime
@@ -2081,6 +2389,18 @@ final class TeleprompterPanel: NSPanel, NSWindowDelegate {
         autoButton.fill = autoScroll ? NSColor(white: 1, alpha: 0.15) : accent
         autoButton.needsDisplay = true
         status.textColor = recordingPaused ? amber : NSColor(white: 1, alpha: 0.55)
+        if standaloneMode {
+            if recordingPaused {
+                status.stringValue = autoScroll ? L("已暂停 · 继续时恢复滚动", "Paused · scrolling resumes when continued")
+                                                : L("已暂停 · 可手动滚动", "Paused · scroll manually")
+            } else if reachedEnd {
+                status.stringValue = L("已到稿件末尾 · 可回到开头", "End of script · return to the beginning")
+            } else {
+                status.stringValue = autoScroll ? L("自动滚动中 · 可手动调整", "Auto-scrolling · scroll manually to adjust")
+                                                : L("手动滚动 · 开启自动滚动开始提词", "Scroll manually, or start Auto-scroll")
+            }
+            return
+        }
         let mode = previewMode ? L("预览", "Preview") : L("录制中", "Recording")
         if recordingPaused {
             status.stringValue = autoScroll ? L("录制已暂停 · 滚动同步暂停", "Recording paused · scrolling paused")
@@ -2902,6 +3222,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var narrationLocalRegion: CGRect?
     var narrationFullDisplay = false
     var narrationScreenObserver: NSObjectProtocol?
+    var standalonePrompterSetup: StandalonePrompterController?
+    var standalonePrompter: TeleprompterPanel?
+    var standalonePrompterTimer: Timer?
+    var standalonePrompterDisplayID: CGDirectDisplayID?
+    var standaloneScreenObserver: NSObjectProtocol?
     var statusItem: NSStatusItem?
     var busy = false                 // picking / counting down / recording
     var processing: [String] = []    // sessions being processed by an agent
@@ -3103,10 +3428,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let i = args.firstIndex(of: "--process"), i + 1 < args.count {
             let agent = args.firstIndex(of: "--agent").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } ?? "claude"
             process(URL(fileURLWithPath: args[i + 1]), with: agent)
+        } else if args.contains("--prompter") {
+            mStandalonePrompter()
         } else if args.contains("--narrate") {
             mNarration()
         } else if !args.contains("--background") {
-            mNarration()
+            openPreferredMode()
         }
     }
 
@@ -3125,11 +3452,18 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func reopenResident() {
         guard resident else { return }
+        if standalonePrompterSetup != nil { standalonePrompterSetup?.show(); return }
         if narrationSetup != nil { showNarrationControls(); return }
-        if !busy { mNarration() }
+        if !busy { openPreferredMode() }
+    }
+
+    func openPreferredMode() {
+        if recordConfig()["launch_mode"] as? String == "prompter" { mStandalonePrompter() }
+        else { mNarration() }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        closeStandalonePrompter()
         stopNarrationPreview()
         closePreviewPrompter()
         narrationSetup?.cancel()   // Flush any pending draft edit before the app exits.
@@ -3137,6 +3471,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func startRecording(useLast: Bool, narrationScript: String? = nil) {
         guard !busy else { return }
+        closeStandalonePrompter()
         opts.narrationScript = narrationScript
         opts.recordingDisplayID = nil
         opts.recordingDisplayFrame = nil
@@ -3384,12 +3719,21 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if narrationSetup != nil {
             _ = add(L("录制讲解视频（带提词）…", "Record narration with teleprompter…"), #selector(mNarration))
+            _ = add(L("单独使用提词器…", "Use teleprompter on its own…"), #selector(mStandalonePrompter))
             _ = add(L("取消本次讲解准备", "Cancel narration setup"), #selector(mCancelNarration))
             menu.addItem(.separator())
             _ = add(L("退出口喷鸡", "Quit blurt"), #selector(mQuit), key: "q")
             return
         }
         if busy { _ = add(L("正在准备或保存录制…", "Preparing or saving recording…"), nil); return }
+        if let standalone = standalonePrompterSetup {
+            _ = add(L("提词器设置…", "Teleprompter settings…"), #selector(mStandalonePrompter))
+            _ = add(standalone.prompterEnabled ? L("隐藏提词器", "Hide teleprompter") : L("显示提词器", "Show teleprompter"), #selector(mToggleStandalonePrompter))
+            _ = add(L("结束独立提词", "Close standalone teleprompter"), #selector(mCloseStandalonePrompter))
+            menu.addItem(.separator())
+        } else {
+            _ = add(L("单独使用提词器…", "Use teleprompter on its own…"), #selector(mStandalonePrompter))
+        }
         _ = add(L("录制讲解视频（带提词）…", "Record narration with teleprompter…"), #selector(mNarration))
         _ = add(L("开始录制", "Start recording") + "   ⌥⇧R", #selector(mStart))
         if lastRegionFromConfig() != nil { _ = add(L("录制上次的区域", "Record the last area"), #selector(mStartLast)) }
@@ -3459,12 +3803,131 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func mStart() { startRecording(useLast: false) }
+
+    @objc func mStandalonePrompter() {
+        // Preparation can be left safely; an active take/countdown/save cannot.
+        guard rec == nil else { return }
+        if let setup = standalonePrompterSetup { setup.show(); return }
+        if narrationSetup != nil {
+            closeNarrationControls()
+            busy = false
+        }
+        guard !busy else { return }
+        setRecordConfig("launch_mode", "prompter")
+        let setup = StandalonePrompterController()
+        standalonePrompterSetup = setup
+        let fallback = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? NSScreen.main
+        standalonePrompterDisplayID = TeleprompterPanel.preferredDisplayID(fallback: fallback.map(narrationDisplayID))
+        setup.onChange = { [weak self] script, enabled in self?.updateStandalonePrompter(script: script, enabled: enabled) }
+        setup.onSelectDisplay = { [weak self] id in self?.selectStandalonePrompterDisplay(id) }
+        standaloneScreenObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                                                          object: nil, queue: .main) { [weak self] _ in
+            // The panel has its own screen-change observer and may run after us.
+            DispatchQueue.main.async { [weak self] in self?.refreshStandaloneDisplays() }
+        }
+        refreshStandaloneDisplays()
+        setup.show()
+        updateStandalonePrompter(script: setup.scriptValue, enabled: setup.prompterEnabled)
+    }
+
+    @objc func mToggleStandalonePrompter() {
+        guard let setup = standalonePrompterSetup else { return }
+        setup.setPrompterEnabled(!setup.prompterEnabled)
+    }
+
+    @objc func mCloseStandalonePrompter() { closeStandalonePrompter() }
+
+    func availableNarrationDisplays() -> [NarrationDisplayOption] {
+        let screens = NSScreen.screens
+        return screens.enumerated().map { index, screen in
+            let id = narrationDisplayID(screen)
+            let name = CGDisplayIsBuiltin(id) != 0 ? L("内建显示屏", "Built-in display") : screen.localizedName
+            let duplicate = screens.filter { $0.localizedName == screen.localizedName }.count > 1
+            return NarrationDisplayOption(id: id, title: name + (duplicate ? " (\(index + 1))" : ""))
+        }
+    }
+
+    func refreshStandaloneDisplays() {
+        guard let setup = standalonePrompterSetup else { return }
+        if let actual = standalonePrompter?.currentDisplayID {
+            standalonePrompterDisplayID = actual
+        } else if narrationScreen(standalonePrompterDisplayID) == nil {
+            standalonePrompterDisplayID = TeleprompterPanel.preferredDisplayID(fallback: NSScreen.main.map(narrationDisplayID))
+        }
+        setup.setDisplayOptions(availableNarrationDisplays(), selected: standalonePrompterDisplayID)
+    }
+
+    func selectStandalonePrompterDisplay(_ id: CGDirectDisplayID) {
+        guard standalonePrompterSetup != nil, narrationScreen(id) != nil else { return }
+        standalonePrompterDisplayID = id
+        TeleprompterPanel.rememberPreferredDisplay(id)
+        standalonePrompter?.move(to: id)
+        refreshStandaloneDisplays()
+    }
+
+    func updateStandalonePrompter(script: String, enabled: Bool) {
+        guard standalonePrompterSetup != nil, rec == nil, narrationSetup == nil else { return }
+        if !enabled {
+            standalonePrompterTimer?.invalidate()
+            standalonePrompterTimer = nil
+            standalonePrompter?.update(paused: true)
+            standalonePrompter?.orderOut(nil)
+            return
+        }
+        if standalonePrompter == nil {
+            guard let screen = narrationScreen(standalonePrompterDisplayID) ?? NSScreen.main ?? NSScreen.screens.first else { return }
+            let panel = TeleprompterPanel(script: script)
+            panel.setStandaloneMode(true)
+            panel.onClose = { [weak self] in self?.standalonePrompterSetup?.setPrompterEnabled(false) }
+            panel.onEdit = { [weak self] in self?.standalonePrompterSetup?.show() }
+            panel.onDisplayChange = { [weak self] id in
+                self?.standalonePrompterDisplayID = id
+                self?.refreshStandaloneDisplays()
+            }
+            panel.place(near: toCG(screen.frame))
+            standalonePrompter = panel
+            refreshStandaloneDisplays()
+        }
+        standalonePrompter?.setScript(script)
+        standalonePrompter?.orderFrontRegardless()
+        standalonePrompter?.update(paused: false)
+        if standalonePrompterTimer == nil {
+            standalonePrompterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+                guard let panel = self?.standalonePrompter, panel.isVisible else { return }
+                panel.update(paused: false)
+            }
+        }
+    }
+
+    func closeStandalonePrompter() {
+        let setup = standalonePrompterSetup
+        standalonePrompterSetup = nil
+        setup?.onChange = nil
+        setup?.onSelectDisplay = nil
+        setup?.onHide = nil
+        setup?.close() // Synchronously saves the last editor keystroke.
+        standalonePrompterTimer?.invalidate()
+        standalonePrompterTimer = nil
+        if let observer = standaloneScreenObserver { NotificationCenter.default.removeObserver(observer) }
+        standaloneScreenObserver = nil
+        standalonePrompter?.onClose = nil
+        standalonePrompter?.onEdit = nil
+        standalonePrompter?.onDisplayChange = nil
+        standalonePrompter?.stopScrolling()
+        standalonePrompter?.orderOut(nil)
+        standalonePrompter = nil
+        standalonePrompterDisplayID = nil
+    }
+
     @objc func mNarration() {
         if narrationSetup != nil { showNarrationControls(); return }
         guard !busy else { return }
+        closeStandalonePrompter()
+        setRecordConfig("launch_mode", "narration")
         busy = true
         let setup = NarrationSetupController()
         narrationSetup = setup
+        setup.onUseStandalone = { [weak self] in self?.mStandalonePrompter() }
         setup.onCancel = { [weak self] in
             guard let self = self, self.rec == nil else { return }
             self.closeNarrationControls()
@@ -3540,19 +4003,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func refreshNarrationDisplays() {
         guard let setup = narrationSetup else { return }
-        let screens = NSScreen.screens
-        let options = screens.enumerated().map { index, screen -> NarrationDisplayOption in
-            let id = narrationDisplayID(screen)
-            let name = CGDisplayIsBuiltin(id) != 0 ? L("内建显示屏", "Built-in display") : screen.localizedName
-            let duplicate = screens.filter { $0.localizedName == screen.localizedName }.count > 1
-            return NarrationDisplayOption(id: id, title: name + (duplicate ? " (\(index + 1))" : ""))
-        }
         if let actual = rec?.teleprompter?.currentDisplayID ?? previewPrompter?.currentDisplayID {
             narrationPrompterDisplayID = actual
         } else if narrationScreen(narrationPrompterDisplayID) == nil {
             narrationPrompterDisplayID = TeleprompterPanel.preferredDisplayID(fallback: narrationRecordingDisplayID)
         }
-        setup.setDisplayOptions(options, recording: narrationRecordingDisplayID, prompter: narrationPrompterDisplayID)
+        setup.setDisplayOptions(availableNarrationDisplays(), recording: narrationRecordingDisplayID, prompter: narrationPrompterDisplayID)
     }
 
     func selectNarrationRecordingDisplay(_ id: CGDirectDisplayID) {
