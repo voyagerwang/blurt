@@ -33,7 +33,29 @@ https://github.com/user-attachments/assets/334087d3-9b56-48fa-808a-2fb229ab666a
 一段录屏里可以混着讲，每一条是问题、想法、笔记还是待办，由 agent 自己判断。团队也可以加自己的
 [模板（lens）](skills/blurt/reference/schema.md#custom-lenses)，比如 `ux-research`、`sales-call`、`sop`。
 
-## 安装
+## 本分支：讲解录制与提词器
+
+本分支基于 [AGIHunt/blurt](https://github.com/AGIHunt/blurt)，增加 macOS 讲解录制和处理记录页面。
+
+打开 Blurt 先进入录制准备：预览画面、选择录制屏幕或区域、填写讲稿、开关提词器和麦克风，点击「开始录制」才倒计时。录制屏幕与提词器屏幕独立选择，支持录外接屏、在另一块屏幕看稿。提词窗可拖动、四角缩放或输入宽高，并记住屏幕、位置和尺寸；支持手动滚动、自动滚动、速度和字号调节。录制中也可修改或隐藏提词器。
+
+讲解模式完成后另存为 H.264/AAC MP4，不自动交给 Agent 整理；取消另存仍保留录制文件夹中的原视频。Blurt 使用应用级排除隐藏自身提词窗和控制条；其他录屏软件不受此设置约束。普通反馈录制和处理记录入口保留在菜单中。处理记录页可查看整理、审核与后续任务状态，并复制交接上下文；后续执行需要用户填写任务后明确启动。
+
+安装本分支：
+
+```bash
+npx skills add voyagerwang/blurt
+```
+
+从本仓库构建原生应用（macOS，需 `uv` 和 Xcode Command Line Tools）：
+
+```bash
+uv run skills/blurt/scripts/record.py build
+```
+
+构建后安装到 `~/Applications/Blurt.app`。原生回归测试与验收边界见 [tests/README.md](tests/README.md)。本次自动检查使用隔离界面和合成音视频；真实桌面录制中的应用排除、麦克风和外接屏拔插仍需单独验收。
+
+## 上游安装与反馈录制
 
 ```bash
 npx skills add AGIHunt/blurt

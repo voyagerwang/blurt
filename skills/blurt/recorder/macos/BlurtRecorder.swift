@@ -13,8 +13,10 @@ import AppKit
 import AVFoundation
 import Carbon.HIToolbox
 import CoreMedia
+import CoreImage
 import ScreenCaptureKit
 import ServiceManagement
+import UniformTypeIdentifiers
 
 // MARK: - Options & utilities
 
@@ -31,6 +33,10 @@ struct Options {
     var preselect: CGRect? = nil   // picker opens with this selection (testing / "last region")
     var mic = true
     var micName: String? = nil
+    var narrationScript: String? = nil
+    var prompterEnabled = true
+    var recordingDisplayID: CGDirectDisplayID?
+    var recordingDisplayFrame: CGRect?
 
     static func parse() -> Options {
         var o = Options()
@@ -103,8 +109,20 @@ var primaryHeight: CGFloat { NSScreen.screens.first?.frame.maxY ?? 0 }
 func toCG(_ r: NSRect) -> CGRect { CGRect(x: r.minX, y: primaryHeight - r.maxY, width: r.width, height: r.height) }
 func toNS(_ r: CGRect) -> NSRect { NSRect(x: r.minX, y: primaryHeight - r.maxY, width: r.width, height: r.height) }
 
-/// Our chrome is hidden from every screen capture; BLURT_DEBUG_CHROME=1 makes it screenshot-able (still excluded
-/// from blurt's own recording via the content filter).
+func narrationDisplayID(_ screen: NSScreen) -> CGDirectDisplayID {
+    (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
+}
+func narrationDisplayUUID(_ id: CGDirectDisplayID) -> String? {
+    guard let uuid = CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue() else { return nil }
+    return CFUUIDCreateString(nil, uuid) as String
+}
+func narrationScreen(_ id: CGDirectDisplayID?) -> NSScreen? {
+    guard let id = id else { return nil }
+    return NSScreen.screens.first { narrationDisplayID($0) == id }
+}
+
+/// Legacy sharing hint only. Blurt's SCContentFilter excludes this entire application, including later windows.
+/// Other recording apps choose their own filters and may capture these windows.
 let chromeSharing: NSWindow.SharingType = ProcessInfo.processInfo.environment["BLURT_DEBUG_CHROME"] == nil ? .none : .readOnly
 
 func activateApp() {
@@ -141,11 +159,13 @@ final class PickerController {
     var snapped = false             // selection came from clicking a window (or F / last area): drag = draw new
     var hovered: NSRect?
     var onDone: ((CGRect?) -> Void)?
+    var selectionOnly = false
+    var targetDisplayID: CGDirectDisplayID?
     let toolbar = PickerToolbar()
     var toolbarHost: NSView?
 
     func show(preselect: CGRect?) {
-        for screen in NSScreen.screens {
+        for screen in NSScreen.screens where targetDisplayID == nil || narrationDisplayID(screen) == targetDisplayID {
             let w = KeyWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
             w.level = .screenSaver
             w.isOpaque = false
@@ -173,7 +193,8 @@ final class PickerController {
     }
 
     func screenFrame(containing p: NSPoint) -> NSRect {
-        (NSScreen.screens.first(where: { $0.frame.contains(p) }) ?? NSScreen.screens[0]).frame
+        if let target = narrationScreen(targetDisplayID) { return target.frame }
+        return (NSScreen.screens.first(where: { $0.frame.contains(p) }) ?? NSScreen.screens[0]).frame
     }
 
     func refresh() {
@@ -198,7 +219,19 @@ final class PickerController {
     }
 
     func finish(_ start: Bool) {
-        let result = start ? selection.map { toCG($0).integral } : nil
+        var result: CGRect?
+        if start, let selection = selection {
+            if let targetID = targetDisplayID {
+                // Confirm against the chosen display again: keyboard nudges or
+                // a changed screen layout must never retarget the recording.
+                if let screen = narrationScreen(targetID) {
+                    let clipped = toCG(selection).integral.intersection(toCG(screen.frame))
+                    if !clipped.isNull, clipped.width >= 8, clipped.height >= 8 { result = clipped }
+                }
+            } else {
+                result = toCG(selection).integral
+            }
+        }
         windows.forEach { $0.orderOut(nil) }
         windows.removeAll()
         onDone?(result)
@@ -211,7 +244,11 @@ final class PickerController {
     }
 
     func useLast() {
-        if let l = opts.lastRegion { selection = toNS(l); snapped = true; refresh() }
+        if let l = opts.lastRegion {
+            let r = targetDisplayID == nil ? toNS(l) : toNS(l).intersection(screenFrame(containing: NSEvent.mouseLocation))
+            guard !r.isNull, r.width >= 8, r.height >= 8 else { return }
+            selection = r; snapped = true; refresh()
+        }
     }
 }
 
@@ -289,8 +326,9 @@ final class PickerView: NSView {
         }
 
         // hint on every screen, top centre
-        let hint = L("拖拽框选录制区域 · 单击选中窗口 · F 全屏 · ⏎ 开始 · Esc 取消",
-                     "Drag to select an area · Click a window · F full screen · ⏎ start · Esc cancel")
+        let hint = c.selectionOnly
+            ? L("拖拽框选录制区域 · 单击选中窗口 · F 全屏 · ⏎ 确认 · Esc 返回", "Drag an area · Click a window · F full screen · ⏎ confirm · Esc back")
+            : L("拖拽框选录制区域 · 单击选中窗口 · F 全屏 · ⏎ 开始 · Esc 取消", "Drag to select an area · Click a window · F full screen · ⏎ start · Esc cancel")
         let f = NSFont.systemFont(ofSize: 13, weight: .medium)
         let w = NSAttributedString(string: hint, attributes: [.font: f]).size().width + 28
         _ = pill(hint, font: f, fg: .white, bg: NSColor(white: 0.06, alpha: 0.78),
@@ -400,6 +438,12 @@ final class PickerView: NSView {
             case kVK_UpArrow: s.origin.y += d
             default: s.origin.y -= d
             }
+            if let target = narrationScreen(c.targetDisplayID) {
+                s.size.width = min(s.width, target.frame.width)
+                s.size.height = min(s.height, target.frame.height)
+                s.origin.x = max(target.frame.minX, min(s.minX, target.frame.maxX - s.width))
+                s.origin.y = max(target.frame.minY, min(s.minY, target.frame.maxY - s.height))
+            }
             c.selection = s
             c.refresh()
         default: super.keyDown(with: e)
@@ -446,22 +490,28 @@ final class PillButton: NSButton {
     }
 }
 
-final class PickerToolbar: NSVisualEffectView {
+// Paint the capsule itself: visual-effect materials can composite a rectangular
+// backing through clear window corners even when their layer is rounded.
+class BlurtFloatingSurfaceView: NSView {
+    var permitsWindowDrag = false
+    override var isOpaque: Bool { false }
+    override var allowsVibrancy: Bool { false }
+    override var mouseDownCanMoveWindow: Bool { permitsWindowDrag }
+    override func draw(_ dirty: NSRect) {
+        NSColor(calibratedWhite: 0.075, alpha: 0.97).setFill()
+        let radius = min(bounds.height / 2, 24)
+        NSBezierPath(roundedRect: bounds, xRadius: radius, yRadius: radius).fill()
+    }
+}
+
+final class PickerToolbar: BlurtFloatingSurfaceView {
     weak var controller: PickerController?
     private var built = false
 
     func layoutButtons(hasLast: Bool) {
         if built { return }
         built = true
-        material = .hudWindow
-        blendingMode = .behindWindow
-        state = .active
-        appearance = NSAppearance(named: .vibrantDark)
-        wantsLayer = true
-        layer?.cornerRadius = 22
-        layer?.borderWidth = 0.5
-        layer?.borderColor = NSColor(white: 1, alpha: 0.14).cgColor
-        layer?.masksToBounds = true
+        appearance = NSAppearance(named: .darkAqua)
         var buttons: [NSButton] = []
         buttons.append(PillButton(L("全屏", "Full screen"), symbol: "arrow.up.left.and.arrow.down.right",
                                   fill: NSColor(white: 1, alpha: 0.1), target: self, action: #selector(full)))
@@ -470,7 +520,7 @@ final class PickerToolbar: NSVisualEffectView {
                                       fill: NSColor(white: 1, alpha: 0.1), target: self, action: #selector(last)))
         }
         buttons.append(PillButton(L("取消", "Cancel"), fill: NSColor(white: 1, alpha: 0.1), target: self, action: #selector(cancel)))
-        buttons.append(PillButton(L("开始录制", "Start recording"), symbol: "record.circle.fill", fill: accent,
+        buttons.append(PillButton(controller?.selectionOnly == true ? L("使用此区域", "Use this area") : L("开始录制", "Start recording"), symbol: "record.circle.fill", fill: accent,
                                   target: self, action: #selector(start)))
         var x: CGFloat = 6
         for b in buttons {
@@ -580,6 +630,7 @@ final class HUD: NSPanel {
     let status = NSTextField(labelWithString: "")
     let meter = LevelView(frame: NSRect(x: 0, y: 0, width: 26, height: 20))
     var pauseBtn: IconButton!
+    var prompterBtn: IconButton?
     weak var rec: Recorder?
 
     init(rec: Recorder) {
@@ -589,23 +640,18 @@ final class HUD: NSPanel {
         level = .statusBar
         isFloatingPanel = true
         hidesOnDeactivate = false
+        isMovable = true
         isMovableByWindowBackground = true
         backgroundColor = .clear
         isOpaque = false
+        appearance = NSAppearance(named: .darkAqua)
         hasShadow = true
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         sharingType = chromeSharing
 
-        let fx = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 314, height: 48))
-        fx.material = .hudWindow
-        fx.blendingMode = .behindWindow
-        fx.state = .active
-        fx.appearance = NSAppearance(named: .vibrantDark)
-        fx.wantsLayer = true
-        fx.layer?.cornerRadius = 24
-        fx.layer?.masksToBounds = true
-        fx.layer?.borderWidth = 0.5
-        fx.layer?.borderColor = NSColor(white: 1, alpha: 0.14).cgColor
+        let fx = BlurtFloatingSurfaceView(frame: NSRect(x: 0, y: 0, width: 314, height: 48))
+        fx.permitsWindowDrag = true
+        fx.autoresizingMask = [.width, .height]
         contentView = fx
 
         dot.wantsLayer = true
@@ -644,9 +690,23 @@ final class HUD: NSPanel {
         redo.frame.origin = NSPoint(x: 186, y: 8)
         fx.addSubview(pauseBtn)
         fx.addSubview(redo)
-        let done = PillButton(L("完成", "Finish"), symbol: "stop.fill", fill: NSColor.systemRed.withAlphaComponent(0.92), target: self, action: #selector(stopRec))
-        done.toolTip = L("结束录制，开始整理（⌥⇧S）", "Stop and process (⌥⇧S)")
-        done.frame.origin = NSPoint(x: 224, y: 8)
+        var nextX: CGFloat = 224
+        if opts.narrationScript != nil {
+            let prompt = IconButton(symbol: "text.bubble.fill", tip: L("显示 / 关闭提词器", "Show / hide teleprompter"), target: self, action: #selector(togglePrompter))
+            prompt.frame.origin = NSPoint(x: nextX, y: 8)
+            fx.addSubview(prompt)
+            prompterBtn = prompt
+            nextX += 36
+            let settings = IconButton(symbol: "slider.horizontal.3", tip: L("录制设置与讲稿", "Recording controls and script"), target: self, action: #selector(editNarration))
+            settings.frame.origin = NSPoint(x: nextX, y: 8)
+            fx.addSubview(settings)
+            nextX += 36
+        }
+        let done = PillButton(L("完成", "Finish"), symbol: "stop.fill", fill: accent, target: self, action: #selector(stopRec))
+        done.toolTip = opts.narrationScript == nil
+            ? L("结束录制，开始整理（⌥⇧S）", "Stop and process (⌥⇧S)")
+            : L("结束录制并保存 MP4（⌥⇧S）", "Finish and save MP4 (⌥⇧S)")
+        done.frame.origin = NSPoint(x: nextX, y: 8)
         fx.addSubview(done)
         let w = done.frame.maxX + 8
         setContentSize(NSSize(width: w, height: 48))
@@ -673,10 +733,13 @@ final class HUD: NSPanel {
         dot.layer?.backgroundColor = (paused ? amber : NSColor.systemRed).cgColor
         pauseBtn.symbol = paused ? "play.fill" : "pause.fill"
         meter.level = paused ? 0 : lv
+        prompterBtn?.symbol = rec?.prompterVisible == true ? "text.bubble.fill" : "text.bubble"
     }
 
     @objc func togglePause() { rec?.togglePause() }
     @objc func stopRec() { rec?.stop() }
+    @objc func togglePrompter() { if let rec = rec { rec.setPrompterEnabled(!rec.prompterVisible) } }
+    @objc func editNarration() { rec?.onEditNarration?() }
     @objc func redoRec() {
         guard let rec = rec else { return }
         let wasPaused = rec.isPaused
@@ -711,6 +774,1506 @@ func overlayWindow(_ frame: NSRect, view: NSView) -> NSWindow {
     return w
 }
 
+// MARK: - Narration setup and private teleprompter
+
+// Recording preparation: preview first, optional teleprompter, local script draft.
+// This fragment uses L, accent, chromeSharing, activateApp, recordConfig,
+// setRecordConfig, PillButton and IconButton from BlurtRecorder.swift.
+
+struct NarrationDisplayOption {
+    let id: CGDirectDisplayID
+    let title: String
+}
+
+// Keep the selected name compact while the menu exposes complete display names.
+private final class NarrationDisplaySelector: NSButton {
+    private var options: [NarrationDisplayOption] = []
+    private(set) var selectedDisplayID: CGDirectDisplayID?
+    var onSelect: ((CGDirectDisplayID) -> Void)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        isBordered = false
+        target = self
+        action = #selector(showDisplayMenu)
+        setAccessibilityRole(.popUpButton)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override var allowsVibrancy: Bool { false }
+    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: 34) }
+    override func resetCursorRects() { if isEnabled { addCursorRect(bounds, cursor: .pointingHand) } }
+
+    func setOptions(_ options: [NarrationDisplayOption], selected: CGDirectDisplayID?) {
+        self.options = options
+        selectedDisplayID = selected
+        if let item = options.first(where: { $0.id == selected }) { title = item.title }
+        else if options.isEmpty { title = L("没有可用屏幕", "No displays available") }
+        else { title = selected == nil ? L("选择屏幕", "Choose a display") : L("屏幕已断开", "Display disconnected") }
+        toolTip = title
+        setAccessibilityValue(title)
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor(white: 1, alpha: isEnabled ? 0.075 : 0.035).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: 10, yRadius: 10).fill()
+        let color = NSColor(white: 1, alpha: isEnabled ? 0.88 : 0.32)
+        let symbols: [(String, NSRect)] = [
+            ("display", NSRect(x: 11, y: (bounds.height - 16) / 2, width: 16, height: 16)),
+            ("chevron.down", NSRect(x: bounds.width - 23, y: (bounds.height - 11) / 2, width: 11, height: 11))]
+        for (symbol, rect) in symbols {
+            NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
+                    .applying(.init(paletteColors: [color])))?.draw(in: rect)
+        }
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byTruncatingTail
+        (title as NSString).draw(in: NSRect(x: 36, y: (bounds.height - 17) / 2,
+                                          width: max(1, bounds.width - 68), height: 17),
+                                withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .medium),
+                                                 .foregroundColor: color, .paragraphStyle: paragraph])
+    }
+
+    @objc private func showDisplayMenu() {
+        guard isEnabled, !options.isEmpty else { return }
+        let menu = NSMenu()
+        menu.appearance = NSAppearance(named: .darkAqua)
+        for option in options {
+            let item = NSMenuItem(title: option.title, action: #selector(selectDisplayItem(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = NSNumber(value: option.id)
+            item.state = option.id == selectedDisplayID ? .on : .off
+            menu.addItem(item)
+        }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: bounds.minY - 4), in: self)
+    }
+
+    @objc private func selectDisplayItem(_ sender: NSMenuItem) {
+        guard isEnabled, let number = sender.representedObject as? NSNumber,
+              options.contains(where: { $0.id == number.uint32Value }) else { return }
+        let id = number.uint32Value
+        guard id != selectedDisplayID else { return }
+        setOptions(options, selected: id)
+        onSelect?(id)
+    }
+}
+
+private final class NarrationSetupWindow: NSWindow {
+    weak var setupController: NarrationSetupController?
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+    override func cancelOperation(_ sender: Any?) { setupController?.cancel() }
+}
+
+private final class NarrationSetupDragView: NSView {
+    override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
+}
+
+// Screen image resolution must never drive the window's minimum/fitting size.
+private final class NarrationPreviewImageView: NSImageView {
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
+    }
+}
+
+// The menu-bar app has no Edit menu. Preserve ordinary multiline-editor shortcuts.
+private final class NarrationScriptTextView: NSTextView {
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.contains(.command), !flags.contains(.option), !flags.contains(.control) else {
+            return super.performKeyEquivalent(with: event)
+        }
+        switch event.charactersIgnoringModifiers?.lowercased() {
+        case "a": selectAll(nil)
+        case "c": copy(nil)
+        case "v": pasteAsPlainText(nil)
+        case "x": cut(nil)
+        case "z":
+            if flags.contains(.shift) { undoManager?.redo() } else { undoManager?.undo() }
+        default: return super.performKeyEquivalent(with: event)
+        }
+        return true
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard string.isEmpty else { return }
+        let text = L("在这里输入或粘贴讲解内容…\n\n可以先看画面，再慢慢准备。关闭提词器也会保留草稿。",
+                     "Type or paste your script here…\n\nCheck your frame, then prepare your words. Turning the teleprompter off keeps your draft.")
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 5
+        (text as NSString).draw(in: NSRect(x: textContainerInset.width + 5, y: textContainerInset.height,
+                                         width: max(40, bounds.width - textContainerInset.width * 2 - 10), height: 180),
+                               withAttributes: [.font: font ?? NSFont.systemFont(ofSize: 15),
+                                                .foregroundColor: NSColor(white: 1, alpha: 0.34),
+                                                .paragraphStyle: paragraph])
+    }
+}
+
+private final class NarrationToggleButton: NSButton {
+    var enabledValue = false { didSet { state = enabledValue ? .on : .off; needsDisplay = true } }
+    var symbol = ""
+    override var allowsVibrancy: Bool { false }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor(white: 1, alpha: 0.055).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: 12, yRadius: 12).fill()
+        let foreground = NSColor(white: 1, alpha: 0.9)
+        if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
+                .applying(.init(paletteColors: [enabledValue ? accent : NSColor(white: 1, alpha: 0.5)]))) {
+            image.draw(in: NSRect(x: 13, y: (bounds.height - 18) / 2, width: 18, height: 18))
+        }
+        let label = NSAttributedString(string: title, attributes: [.font: NSFont.systemFont(ofSize: 13, weight: .medium),
+                                                                   .foregroundColor: foreground])
+        label.draw(at: NSPoint(x: 41, y: (bounds.height - label.size().height) / 2))
+        let track = NSRect(x: bounds.width - 46, y: (bounds.height - 20) / 2, width: 34, height: 20)
+        (enabledValue ? accent : NSColor(white: 1, alpha: 0.2)).setFill()
+        NSBezierPath(roundedRect: track, xRadius: 10, yRadius: 10).fill()
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: NSRect(x: enabledValue ? track.maxX - 18 : track.minX + 2,
+                                   y: track.minY + 2, width: 16, height: 16)).fill()
+    }
+}
+
+final class NarrationSetupController: NSObject, NSWindowDelegate, NSTextViewDelegate {
+    var onStart: ((CGRect, String, Bool, Bool) -> Void)?
+    var onCancel: (() -> Void)?
+    var onChooseRegion: (() -> Void)?
+    var onSelectFullScreen: (() -> Void)?
+    var onSelectRecordingDisplay: ((CGDirectDisplayID) -> Void)?
+    var onSelectPrompterDisplay: ((CGDirectDisplayID) -> Void)?
+    var onPrompterChange: ((String, Bool) -> Void)?
+    var onRetryPreview: (() -> Void)?
+    var onFinish: (() -> Void)?
+    var onHide: (() -> Void)?
+
+    var scriptValue: String { editor?.string ?? savedScript }
+    private(set) var prompterEnabled: Bool
+    private(set) var microphoneEnabled: Bool
+    private var savedScript: String
+    private var selectedRegion: CGRect = .zero
+    private var previewReady = false
+    private var recordingMode = false
+    private var displayOptions: [NarrationDisplayOption] = []
+    private var selectedRecordingDisplay: CGDirectDisplayID?
+    private var selectedPrompterDisplay: CGDirectDisplayID?
+    private var currentRegionLabel = L("正在选择屏幕…", "Selecting a screen…")
+    private var currentPreviewImage: NSImage?
+    private var currentPreviewMessage = L("正在准备画面预览…", "Preparing your preview…")
+    private var previewHasError = false
+    private var finished = false
+    private var draftSave: DispatchWorkItem?
+    private var window: NarrationSetupWindow?
+    private var editor: NarrationScriptTextView?
+    private var previewImageView: NSImageView?
+    private var previewPlaceholder: NSView?
+    private var placeholderMessage: NSTextField?
+    private var regionLabel: NSTextField?
+    private var previewStatus: NSTextField?
+    private var scriptHint: NSTextField?
+    private var wordCount: NSTextField?
+    private var startButton: PillButton?
+    private var retryButton: PillButton?
+    private var prompterSwitch: NarrationToggleButton?
+    private var microphoneSwitch: NarrationToggleButton?
+    private var headingLabel: NSTextField?
+    private var subtitleLabel: NSTextField?
+    private var cancelButton: PillButton?
+    private var chooseRegionButton: PillButton?
+    private var fullScreenButton: PillButton?
+    private var recordingDisplaySelector: NarrationDisplaySelector?
+    private var prompterDisplaySelector: NarrationDisplaySelector?
+
+    override init() {
+        let config = recordConfig()
+        savedScript = config["narration_script"] as? String ?? ""
+        prompterEnabled = config["narration_prompter_enabled"] as? Bool ?? true
+        microphoneEnabled = config["narration_microphone_enabled"] as? Bool ?? true
+        super.init()
+    }
+
+    func show() {
+        if window == nil { buildWindow() }
+        finished = false
+        refreshStart()
+        activateApp()
+        if window?.isMiniaturized == true { window?.deminiaturize(nil) }
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    func hideForRegionSelection() {
+        flushDraft(notify: true)
+        window?.orderOut(nil)
+    }
+
+    func setRegion(_ region: CGRect, label: String) {
+        selectedRegion = region
+        currentRegionLabel = label
+        regionLabel?.stringValue = label
+        setPreview(nil)
+    }
+
+    func setDisplayOptions(_ options: [NarrationDisplayOption], recording: CGDirectDisplayID?, prompter: CGDirectDisplayID?) {
+        displayOptions = options
+        selectedRecordingDisplay = recording
+        selectedPrompterDisplay = prompter
+        recordingDisplaySelector?.setOptions(options, selected: recording)
+        prompterDisplaySelector?.setOptions(options, selected: prompter)
+        recordingDisplaySelector?.isEnabled = !recordingMode && !options.isEmpty
+        // A destination can be chosen with the prompter off; it never enables it.
+        prompterDisplaySelector?.isEnabled = !options.isEmpty
+        recordingDisplaySelector?.needsDisplay = true
+        prompterDisplaySelector?.needsDisplay = true
+    }
+
+    func setPreview(_ image: NSImage?) {
+        currentPreviewImage = image
+        previewImageView?.image = image
+        previewReady = image != nil
+        previewPlaceholder?.isHidden = image != nil
+        if image != nil {
+            previewStatus?.stringValue = L("画面已就绪 · 仅录制所选区域", "Ready · only the selected area will be recorded")
+            previewStatus?.textColor = NSColor(white: 1, alpha: 0.56)
+            retryButton?.isHidden = true
+        }
+        refreshStart()
+    }
+
+    // A status update marks the preview as loading/failed until the next image arrives.
+    func setPreviewStatus(_ message: String, error: Bool) {
+        currentPreviewImage = nil
+        currentPreviewMessage = message
+        previewHasError = error
+        previewReady = false
+        previewImageView?.image = nil
+        previewPlaceholder?.isHidden = false
+        placeholderMessage?.stringValue = message
+        previewStatus?.stringValue = error ? L("画面暂不可用，请重试", "Preview unavailable. Try again.") : L("正在连接录制画面…", "Connecting to your screen…")
+        previewStatus?.textColor = error ? accent : NSColor(white: 1, alpha: 0.56)
+        retryButton?.isHidden = !error
+        refreshStart()
+    }
+
+    func setRecordingMode(_ recording: Bool) {
+        if recordingMode && !recording { finished = false }
+        recordingMode = recording
+        headingLabel?.stringValue = recording ? L("录制中", "Recording") : L("录制准备", "Ready to record")
+        subtitleLabel?.stringValue = recording
+            ? L("随时调整讲稿，继续专注讲解。", "Adjust your script while your recording continues.")
+            : L("先确认画面，再开始讲解。", "Frame your screen, then tell your story.")
+        window?.title = recording ? L("录制中 · Blurt", "Recording · Blurt") : L("录制准备 · Blurt", "Recording setup · Blurt")
+        for button in [chooseRegionButton, fullScreenButton] {
+            button?.isEnabled = !recording
+            button?.alphaValue = recording ? 0.35 : 1
+        }
+        microphoneSwitch?.isEnabled = !recording
+        microphoneSwitch?.alphaValue = recording ? 0.35 : 1
+        recordingDisplaySelector?.isEnabled = !recording && !displayOptions.isEmpty
+        recordingDisplaySelector?.needsDisplay = true
+        cancelButton?.title = recording ? L("返回录制", "Back") : L("取消", "Cancel")
+        if let button = cancelButton {
+            let width = NSAttributedString(string: button.title, attributes: [.font: NSFont.systemFont(ofSize: 13, weight: .semibold)]).size().width + 28
+            button.constraints.first(where: { $0.firstAttribute == .width && $0.secondItem == nil })?.constant = width
+        }
+        cancelButton?.needsDisplay = true
+        refreshStart()
+    }
+
+    func setPrompterEnabled(_ enabled: Bool) {
+        prompterEnabled = enabled
+        prompterSwitch?.enabledValue = enabled
+        updateScriptHint()
+        setRecordConfig("narration_prompter_enabled", enabled)
+        onPrompterChange?(scriptValue, enabled)
+    }
+
+    private func buildWindow() {
+        let w = NarrationSetupWindow(contentRect: NSRect(x: 0, y: 0, width: 1020, height: 670),
+                                     styleMask: [.borderless, .resizable], backing: .buffered, defer: false)
+        w.title = L("录制准备 · Blurt", "Recording setup · Blurt")
+        w.minSize = NSSize(width: 940, height: 580)
+        w.isReleasedWhenClosed = false
+        w.isOpaque = false
+        w.backgroundColor = .clear
+        w.hasShadow = true
+        w.appearance = NSAppearance(named: .darkAqua)
+        w.collectionBehavior = [.moveToActiveSpace]
+        w.sharingType = chromeSharing
+        w.setupController = self
+        w.delegate = self
+        window = w
+
+        let content = NSView(frame: NSRect(origin: .zero, size: w.frame.size))
+        content.wantsLayer = true
+        content.layer?.backgroundColor = NSColor(calibratedRed: 0.105, green: 0.112, blue: 0.125, alpha: 1).cgColor
+        content.layer?.cornerRadius = 22
+        content.layer?.masksToBounds = true
+        w.contentView = content
+
+        func add(_ view: NSView, to parent: NSView = content) {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            parent.addSubview(view)
+        }
+        func label(_ value: String, size: CGFloat, weight: NSFont.Weight = .regular,
+                   alpha: CGFloat = 0.9, parent: NSView = content) -> NSTextField {
+            let field = NSTextField(wrappingLabelWithString: value)
+            field.font = .systemFont(ofSize: size, weight: weight)
+            field.textColor = NSColor(white: 1, alpha: alpha)
+            field.isSelectable = false
+            field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            add(field, to: parent)
+            return field
+        }
+        func pane() -> NSView {
+            let view = NSView()
+            view.wantsLayer = true
+            view.layer?.backgroundColor = NSColor(white: 1, alpha: 0.045).cgColor
+            view.layer?.cornerRadius = 16
+            view.layer?.masksToBounds = true
+            add(view)
+            return view
+        }
+        func button(_ value: String, symbol: String? = nil, selector: Selector,
+                    parent: NSView = content, primary: Bool = false) -> PillButton {
+            let result = PillButton(value, symbol: symbol, fill: primary ? accent : NSColor(white: 1, alpha: 0.09),
+                                    target: self, action: selector)
+            let width = result.frame.width
+            add(result, to: parent)
+            result.widthAnchor.constraint(equalToConstant: width).isActive = true
+            result.heightAnchor.constraint(equalToConstant: 34).isActive = true
+            return result
+        }
+
+        let header = NarrationSetupDragView()
+        add(header)
+        let heading = label(L("录制准备", "Ready to record"), size: 24, weight: .bold, parent: header)
+        let subtitle = label(L("先确认画面，再开始讲解。", "Frame your screen, then tell your story."), size: 13, alpha: 0.52, parent: header)
+        headingLabel = heading
+        subtitleLabel = subtitle
+        let brand = label("BLURT", size: 11, weight: .bold, alpha: 0.45, parent: header)
+        let close = IconButton(symbol: "xmark", tip: L("关闭录制准备", "Close recording setup"), target: self, action: #selector(cancel))
+        add(close)
+
+        let left = pane()
+        let right = pane()
+        let previewTitle = label(L("录制画面", "Recording preview"), size: 15, weight: .semibold, parent: left)
+        let recordingDisplayLabel = label(L("录制屏幕", "Recording display"), size: 12, weight: .medium, alpha: 0.65, parent: left)
+        let recordingDisplay = NarrationDisplaySelector(frame: .zero)
+        recordingDisplay.setAccessibilityLabel(L("录制屏幕", "Recording display"))
+        recordingDisplay.onSelect = { [weak self] id in
+            guard let self = self, !self.recordingMode else { return }
+            self.selectedRecordingDisplay = id
+            self.setPreview(nil)
+            self.onSelectRecordingDisplay?(id)
+        }
+        add(recordingDisplay, to: left)
+        recordingDisplaySelector = recordingDisplay
+        let region = label(L("正在选择屏幕…", "Selecting a screen…"), size: 12, alpha: 0.5, parent: left)
+        region.maximumNumberOfLines = 1
+        region.lineBreakMode = .byTruncatingMiddle
+        regionLabel = region
+        let full = button(L("全屏", "Full screen"), symbol: "arrow.up.left.and.arrow.down.right", selector: #selector(selectFullScreen), parent: left)
+        let choose = button(L("选择区域", "Choose area"), symbol: "viewfinder", selector: #selector(chooseRegion), parent: left)
+        fullScreenButton = full
+        chooseRegionButton = choose
+
+        let canvas = NSView()
+        canvas.wantsLayer = true
+        canvas.layer?.backgroundColor = NSColor(calibratedRed: 0.065, green: 0.07, blue: 0.08, alpha: 1).cgColor
+        canvas.layer?.cornerRadius = 10
+        canvas.layer?.masksToBounds = true
+        add(canvas, to: left)
+        let image = NarrationPreviewImageView()
+        image.imageScaling = .scaleProportionallyUpOrDown
+        image.imageAlignment = .alignCenter
+        add(image, to: canvas)
+        previewImageView = image
+        let placeholder = NSView()
+        add(placeholder, to: canvas)
+        previewPlaceholder = placeholder
+        let monitor = NSImageView(image: NSImage(systemSymbolName: "display", accessibilityDescription: nil) ?? NSImage())
+        monitor.contentTintColor = NSColor(white: 1, alpha: 0.2)
+        monitor.imageScaling = .scaleProportionallyUpOrDown
+        add(monitor, to: placeholder)
+        let message = label(L("正在准备画面预览…", "Preparing your preview…"), size: 13, alpha: 0.5, parent: placeholder)
+        message.alignment = .center
+        placeholderMessage = message
+        let status = label(L("正在连接录制画面…", "Connecting to your screen…"), size: 11, alpha: 0.5, parent: left)
+        previewStatus = status
+        let retry = button(L("重试", "Retry"), selector: #selector(retryPreview), parent: left)
+        retry.isHidden = true
+        retryButton = retry
+
+        let scriptTitle = label(L("提词器", "Teleprompter"), size: 15, weight: .semibold, parent: right)
+        let privateBadge = label(L("不录入视频", "Hidden in video"), size: 11, weight: .medium, alpha: 0.45, parent: right)
+        let toggle = NarrationToggleButton(frame: .zero)
+        toggle.title = L("显示提词器", "Show teleprompter")
+        toggle.symbol = "text.bubble"
+        toggle.isBordered = false
+        toggle.target = self
+        toggle.action = #selector(togglePrompter)
+        toggle.enabledValue = prompterEnabled
+        toggle.setAccessibilityLabel(L("显示或关闭提词器", "Show or hide the teleprompter"))
+        add(toggle, to: right)
+        prompterSwitch = toggle
+        let prompterDisplayLabel = label(L("提词器屏幕", "Prompter display"), size: 12, weight: .medium, alpha: 0.65, parent: right)
+        let prompterDisplay = NarrationDisplaySelector(frame: .zero)
+        prompterDisplay.setAccessibilityLabel(L("提词器屏幕", "Prompter display"))
+        prompterDisplay.onSelect = { [weak self] id in
+            guard let self = self else { return }
+            self.selectedPrompterDisplay = id
+            self.onSelectPrompterDisplay?(id)
+        }
+        add(prompterDisplay, to: right)
+        prompterDisplaySelector = prompterDisplay
+        let scriptLabel = label(L("提词内容", "Your script"), size: 12, weight: .medium, alpha: 0.65, parent: right)
+        let count = label("", size: 11, alpha: 0.35, parent: right)
+        count.alignment = .right
+        wordCount = count
+
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+        scroll.borderType = .noBorder
+        scroll.drawsBackground = true
+        scroll.backgroundColor = NSColor(calibratedRed: 0.105, green: 0.112, blue: 0.125, alpha: 1)
+        scroll.contentView.drawsBackground = true
+        scroll.contentView.backgroundColor = scroll.backgroundColor
+        scroll.wantsLayer = true
+        scroll.layer?.cornerRadius = 10
+        scroll.layer?.masksToBounds = true
+        let text = NarrationScriptTextView(frame: NSRect(x: 0, y: 0, width: 340, height: 300))
+        text.isRichText = false
+        text.importsGraphics = false
+        text.allowsUndo = true
+        text.isAutomaticQuoteSubstitutionEnabled = false
+        text.isAutomaticDashSubstitutionEnabled = false
+        text.font = .systemFont(ofSize: 16)
+        text.textColor = NSColor(white: 1, alpha: 0.9)
+        text.insertionPointColor = accent
+        text.drawsBackground = true
+        text.backgroundColor = scroll.backgroundColor
+        text.textContainerInset = NSSize(width: 12, height: 14)
+        text.isVerticallyResizable = true
+        text.isHorizontallyResizable = false
+        text.autoresizingMask = .width
+        text.minSize = .zero
+        text.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        text.textContainer?.widthTracksTextView = true
+        text.textContainer?.containerSize = NSSize(width: 316, height: CGFloat.greatestFiniteMagnitude)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 5
+        text.defaultParagraphStyle = paragraph
+        text.string = savedScript
+        text.delegate = self
+        text.setAccessibilityLabel(L("提词内容，草稿自动保存在本机", "Teleprompter script, draft saved on this Mac"))
+        editor = text
+        scroll.documentView = text
+        add(scroll, to: right)
+        let hint = label("", size: 11, alpha: 0.45, parent: right)
+        hint.maximumNumberOfLines = 2
+        scriptHint = hint
+
+        let microphone = NarrationToggleButton(frame: .zero)
+        microphone.title = L("麦克风", "Microphone")
+        microphone.symbol = "mic.fill"
+        microphone.isBordered = false
+        microphone.target = self
+        microphone.action = #selector(toggleMicrophone)
+        microphone.enabledValue = microphoneEnabled
+        microphone.setAccessibilityLabel(L("录制麦克风声音", "Record microphone audio"))
+        add(microphone)
+        microphoneSwitch = microphone
+        let saveHint = label(L("完成后保存为 MP4", "Save as MP4 when finished"), size: 12, alpha: 0.45)
+        let cancelButton = button(L("取消", "Cancel"), selector: #selector(cancel))
+        self.cancelButton = cancelButton
+        cancelButton.keyEquivalent = "\u{1b}"
+        let start = button(L("开始录制", "Start recording"), symbol: "record.circle.fill", selector: #selector(start), primary: true)
+        start.setAccessibilityLabel(L("确认画面并开始录制", "Confirm the preview and start recording"))
+        startButton = start
+
+        NSLayoutConstraint.activate([
+            header.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 26),
+            header.trailingAnchor.constraint(equalTo: close.leadingAnchor, constant: -12),
+            header.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
+            header.heightAnchor.constraint(equalToConstant: 55),
+            heading.leadingAnchor.constraint(equalTo: header.leadingAnchor), heading.topAnchor.constraint(equalTo: header.topAnchor),
+            subtitle.leadingAnchor.constraint(equalTo: header.leadingAnchor), subtitle.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 5),
+            brand.trailingAnchor.constraint(equalTo: header.trailingAnchor), brand.centerYAnchor.constraint(equalTo: heading.centerYAnchor),
+            close.widthAnchor.constraint(equalToConstant: 32), close.heightAnchor.constraint(equalToConstant: 32),
+            close.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -22), close.topAnchor.constraint(equalTo: content.topAnchor, constant: 23),
+            left.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 22),
+            left.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 17),
+            left.bottomAnchor.constraint(equalTo: microphone.topAnchor, constant: -20),
+            left.widthAnchor.constraint(equalTo: content.widthAnchor, multiplier: 0.59, constant: -24),
+            right.leadingAnchor.constraint(equalTo: left.trailingAnchor, constant: 16),
+            right.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -22),
+            right.topAnchor.constraint(equalTo: left.topAnchor), right.bottomAnchor.constraint(equalTo: left.bottomAnchor),
+            previewTitle.leadingAnchor.constraint(equalTo: left.leadingAnchor, constant: 16), previewTitle.topAnchor.constraint(equalTo: left.topAnchor, constant: 16),
+            recordingDisplayLabel.leadingAnchor.constraint(equalTo: previewTitle.leadingAnchor),
+            recordingDisplayLabel.widthAnchor.constraint(equalToConstant: L("zh", "en") == "zh" ? 84 : 106),
+            recordingDisplayLabel.centerYAnchor.constraint(equalTo: recordingDisplay.centerYAnchor),
+            recordingDisplay.leadingAnchor.constraint(equalTo: recordingDisplayLabel.trailingAnchor, constant: 8),
+            recordingDisplay.trailingAnchor.constraint(equalTo: left.trailingAnchor, constant: -16),
+            recordingDisplay.topAnchor.constraint(equalTo: previewTitle.bottomAnchor, constant: 12),
+            recordingDisplay.heightAnchor.constraint(equalToConstant: 34),
+            region.leadingAnchor.constraint(equalTo: previewTitle.leadingAnchor), region.trailingAnchor.constraint(equalTo: left.trailingAnchor, constant: -16),
+            region.topAnchor.constraint(equalTo: recordingDisplay.bottomAnchor, constant: 8),
+            full.leadingAnchor.constraint(equalTo: previewTitle.leadingAnchor), full.topAnchor.constraint(equalTo: region.bottomAnchor, constant: 12),
+            choose.leadingAnchor.constraint(equalTo: full.trailingAnchor, constant: 8), choose.centerYAnchor.constraint(equalTo: full.centerYAnchor),
+            canvas.leadingAnchor.constraint(equalTo: left.leadingAnchor, constant: 14), canvas.trailingAnchor.constraint(equalTo: left.trailingAnchor, constant: -14),
+            canvas.topAnchor.constraint(equalTo: full.bottomAnchor, constant: 14), canvas.bottomAnchor.constraint(equalTo: left.bottomAnchor, constant: -47),
+            image.leadingAnchor.constraint(equalTo: canvas.leadingAnchor), image.trailingAnchor.constraint(equalTo: canvas.trailingAnchor),
+            image.topAnchor.constraint(equalTo: canvas.topAnchor), image.bottomAnchor.constraint(equalTo: canvas.bottomAnchor),
+            placeholder.centerXAnchor.constraint(equalTo: canvas.centerXAnchor), placeholder.centerYAnchor.constraint(equalTo: canvas.centerYAnchor),
+            placeholder.leadingAnchor.constraint(equalTo: canvas.leadingAnchor, constant: 24), placeholder.trailingAnchor.constraint(equalTo: canvas.trailingAnchor, constant: -24),
+            placeholder.heightAnchor.constraint(equalToConstant: 118),
+            monitor.centerXAnchor.constraint(equalTo: placeholder.centerXAnchor), monitor.topAnchor.constraint(equalTo: placeholder.topAnchor),
+            monitor.widthAnchor.constraint(equalToConstant: 56), monitor.heightAnchor.constraint(equalToConstant: 48),
+            message.topAnchor.constraint(equalTo: monitor.bottomAnchor, constant: 16), message.leadingAnchor.constraint(equalTo: placeholder.leadingAnchor),
+            message.trailingAnchor.constraint(equalTo: placeholder.trailingAnchor),
+            status.leadingAnchor.constraint(equalTo: left.leadingAnchor, constant: 17), status.centerYAnchor.constraint(equalTo: retry.centerYAnchor),
+            status.trailingAnchor.constraint(lessThanOrEqualTo: retry.leadingAnchor, constant: -8),
+            retry.trailingAnchor.constraint(equalTo: left.trailingAnchor, constant: -12), retry.bottomAnchor.constraint(equalTo: left.bottomAnchor, constant: -7),
+            scriptTitle.leadingAnchor.constraint(equalTo: right.leadingAnchor, constant: 16), scriptTitle.topAnchor.constraint(equalTo: right.topAnchor, constant: 16),
+            privateBadge.trailingAnchor.constraint(equalTo: right.trailingAnchor, constant: -16), privateBadge.centerYAnchor.constraint(equalTo: scriptTitle.centerYAnchor),
+            toggle.leadingAnchor.constraint(equalTo: right.leadingAnchor, constant: 14), toggle.trailingAnchor.constraint(equalTo: right.trailingAnchor, constant: -14),
+            toggle.topAnchor.constraint(equalTo: scriptTitle.bottomAnchor, constant: 15), toggle.heightAnchor.constraint(equalToConstant: 42),
+            prompterDisplayLabel.leadingAnchor.constraint(equalTo: right.leadingAnchor, constant: 17),
+            prompterDisplayLabel.widthAnchor.constraint(equalToConstant: L("zh", "en") == "zh" ? 84 : 106),
+            prompterDisplayLabel.centerYAnchor.constraint(equalTo: prompterDisplay.centerYAnchor),
+            prompterDisplay.leadingAnchor.constraint(equalTo: prompterDisplayLabel.trailingAnchor, constant: 8),
+            prompterDisplay.trailingAnchor.constraint(equalTo: right.trailingAnchor, constant: -14),
+            prompterDisplay.topAnchor.constraint(equalTo: toggle.bottomAnchor, constant: 12),
+            prompterDisplay.heightAnchor.constraint(equalToConstant: 34),
+            scriptLabel.leadingAnchor.constraint(equalTo: right.leadingAnchor, constant: 17), scriptLabel.topAnchor.constraint(equalTo: prompterDisplay.bottomAnchor, constant: 16),
+            count.trailingAnchor.constraint(equalTo: right.trailingAnchor, constant: -17), count.centerYAnchor.constraint(equalTo: scriptLabel.centerYAnchor),
+            scroll.leadingAnchor.constraint(equalTo: right.leadingAnchor, constant: 14), scroll.trailingAnchor.constraint(equalTo: right.trailingAnchor, constant: -14),
+            scroll.topAnchor.constraint(equalTo: scriptLabel.bottomAnchor, constant: 9), scroll.bottomAnchor.constraint(equalTo: right.bottomAnchor, constant: -56),
+            hint.leadingAnchor.constraint(equalTo: right.leadingAnchor, constant: 17), hint.trailingAnchor.constraint(equalTo: right.trailingAnchor, constant: -17),
+            hint.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 10),
+            microphone.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 23), microphone.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
+            microphone.widthAnchor.constraint(equalToConstant: 187), microphone.heightAnchor.constraint(equalToConstant: 40),
+            saveHint.leadingAnchor.constraint(equalTo: microphone.trailingAnchor, constant: 17), saveHint.centerYAnchor.constraint(equalTo: microphone.centerYAnchor),
+            start.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24), start.centerYAnchor.constraint(equalTo: microphone.centerYAnchor),
+            cancelButton.trailingAnchor.constraint(equalTo: start.leadingAnchor, constant: -10), cancelButton.centerYAnchor.constraint(equalTo: start.centerYAnchor)
+        ])
+        content.layoutSubtreeIfNeeded()
+        text.setFrameSize(NSSize(width: scroll.contentSize.width, height: max(scroll.contentSize.height, text.frame.height)))
+        refreshStart()
+        refreshCount()
+        updateScriptHint()
+        setDisplayOptions(displayOptions, recording: selectedRecordingDisplay, prompter: selectedPrompterDisplay)
+        region.stringValue = currentRegionLabel
+        if let cached = currentPreviewImage { setPreview(cached) }
+        else { setPreviewStatus(currentPreviewMessage, error: previewHasError) }
+        setRecordingMode(recordingMode)
+        w.center()
+    }
+
+    func textDidChange(_ notification: Notification) {
+        editor?.needsDisplay = true
+        refreshCount()
+        draftSave?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.flushDraft(notify: true) }
+        draftSave = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
+    private func refreshCount() {
+        let count = scriptValue.count
+        wordCount?.stringValue = L("\(count) 字", "\(count) characters")
+    }
+
+    private func updateScriptHint() {
+        scriptHint?.stringValue = prompterEnabled
+            ? L("草稿自动保存 · 提词窗可拖动、缩放", "Draft saved automatically · move and resize the prompter")
+            : L("提词器已关闭 · 草稿保留，可随时开启", "Teleprompter off · your draft is kept for later")
+    }
+
+    private func refreshStart() {
+        let valid = !selectedRegion.isNull && !selectedRegion.isInfinite && selectedRegion.width >= 2 && selectedRegion.height >= 2
+        let enabled = !finished && (recordingMode || (previewReady && valid))
+        startButton?.title = recordingMode ? L("完成录制", "Finish recording") : L("开始录制", "Start recording")
+        startButton?.image = NSImage(systemSymbolName: recordingMode ? "stop.fill" : "record.circle.fill", accessibilityDescription: nil)
+        if let button = startButton {
+            let width = NSAttributedString(string: button.title, attributes: [.font: NSFont.systemFont(ofSize: 13, weight: .semibold)]).size().width + 46
+            button.constraints.first(where: { $0.firstAttribute == .width && $0.secondItem == nil })?.constant = width
+        }
+        startButton?.isEnabled = enabled
+        startButton?.fill = enabled ? accent : NSColor(white: 1, alpha: 0.1)
+        startButton?.fg = NSColor(white: 1, alpha: enabled ? 1 : 0.3)
+        startButton?.needsDisplay = true
+    }
+
+    private func flushDraft(notify: Bool) {
+        draftSave?.cancel()
+        draftSave = nil
+        savedScript = scriptValue
+        setRecordConfig("narration_script", savedScript)
+        if notify { onPrompterChange?(savedScript, prompterEnabled) }
+    }
+
+    @objc private func chooseRegion() { if !recordingMode { onChooseRegion?() } }
+    @objc private func selectFullScreen() { if !recordingMode { onSelectFullScreen?() } }
+    @objc private func retryPreview() { onRetryPreview?() }
+    @objc private func togglePrompter() { setPrompterEnabled(!prompterEnabled) }
+    @objc private func toggleMicrophone() {
+        guard !recordingMode else { return }
+        microphoneEnabled.toggle()
+        microphoneSwitch?.enabledValue = microphoneEnabled
+        setRecordConfig("narration_microphone_enabled", microphoneEnabled)
+    }
+    @objc private func start() {
+        if recordingMode {
+            guard !finished else { return }
+            finished = true
+            flushDraft(notify: true)
+            window?.orderOut(nil)
+            onFinish?()
+            return
+        }
+        guard !finished, previewReady, selectedRegion.width >= 2, selectedRegion.height >= 2,
+              !selectedRegion.isNull, !selectedRegion.isInfinite else { return }
+        finished = true
+        flushDraft(notify: false)
+        // Keep an owned window present while Recorder.prepare resolves the exclusion filter.
+        // App.begin hides this window only after capture setup has succeeded.
+        onStart?(selectedRegion, scriptValue, prompterEnabled, microphoneEnabled)
+    }
+    @objc func cancel() {
+        if recordingMode {
+            flushDraft(notify: true)
+            window?.orderOut(nil)
+            onHide?()
+            return
+        }
+        guard !finished else { return }
+        finished = true
+        flushDraft(notify: false)
+        window?.orderOut(nil)
+        onCancel?()
+    }
+    func windowShouldClose(_ sender: NSWindow) -> Bool { cancel(); return false }
+    deinit { draftSave?.cancel() }
+}
+
+
+private final class TeleprompterTextView: NSTextView {
+    override var acceptsFirstResponder: Bool { false }
+    override var mouseDownCanMoveWindow: Bool { false }
+}
+
+private final class TeleprompterDragView: NSView {
+    var onBegin: (() -> Void)?
+    var onEnd: (() -> Void)?
+    // Static title/subtitle labels otherwise win hit-testing and swallow the drag.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let hit = super.hitTest(point) else { return nil }
+        return hit is NSTextField ? self : hit
+    }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) {
+        onBegin?(); window?.performDrag(with: event); onEnd?()
+    }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
+}
+
+// Paint the entire content view; the transparent window has no title-bar/background rim.
+private final class TeleprompterSurfaceView: NSView {
+    var onLayout: (() -> Void)?
+    override var isOpaque: Bool { false }
+    override func draw(_ dirty: NSRect) {
+        NSColor(calibratedWhite: 0.075, alpha: 0.97).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: 20, yRadius: 20).fill()
+    }
+    override func layout() { super.layout(); onLayout?() }
+}
+
+private enum TeleprompterResizeCorner: CaseIterable {
+    case topLeft, topRight, bottomLeft, bottomRight
+    var isLeft: Bool { self == .topLeft || self == .bottomLeft }
+    var isTop: Bool { self == .topLeft || self == .topRight }
+    var label: String {
+        switch self {
+        case .topLeft: return L("左上角", "Top-left corner")
+        case .topRight: return L("右上角", "Top-right corner")
+        case .bottomLeft: return L("左下角", "Bottom-left corner")
+        case .bottomRight: return L("右下角", "Bottom-right corner")
+        }
+    }
+    func desiredSize(from initial: NSSize, delta: NSPoint) -> NSSize {
+        NSSize(width: initial.width + (isLeft ? -delta.x : delta.x),
+               height: initial.height + (isTop ? delta.y : -delta.y))
+    }
+    func resizedFrame(from initial: NSRect, to desired: NSSize, in visible: NSRect, minimum: NSSize) -> NSRect {
+        // Normalize a manually moved-offscreen window once, then keep the opposite corner fixed.
+        let minW = min(minimum.width, visible.width), minH = min(minimum.height, visible.height)
+        let initialW = min(visible.width, max(minW, initial.width))
+        let initialH = min(visible.height, max(minH, initial.height))
+        let anchor = NSRect(x: max(visible.minX, min(initial.minX, visible.maxX - initialW)),
+                            y: max(visible.minY, min(initial.minY, visible.maxY - initialH)),
+                            width: initialW, height: initialH)
+        let maxW = isLeft ? anchor.maxX - visible.minX : visible.maxX - anchor.minX
+        let maxH = isTop ? visible.maxY - anchor.minY : anchor.maxY - visible.minY
+        let width = min(maxW, max(minW, desired.width)), height = min(maxH, max(minH, desired.height))
+        return NSRect(x: isLeft ? anchor.maxX - width : anchor.minX,
+                      y: isTop ? anchor.minY : anchor.maxY - height, width: width, height: height)
+    }
+}
+
+private final class TeleprompterResizeView: NSView {
+    let corner: TeleprompterResizeCorner
+    var onBegin: (() -> Void)?
+    var onResize: ((NSSize) -> Void)?
+    var onEnd: (() -> Void)?
+    private var startPoint = NSPoint.zero
+    private var startSize = NSSize.zero
+    private static let risingCursor = diagonalCursor(descending: false)
+    private static let fallingCursor = diagonalCursor(descending: true)
+
+    init(corner: TeleprompterResizeCorner) { self.corner = corner; super.init(frame: .zero) }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    private static func diagonalCursor(descending: Bool) -> NSCursor {
+        let image = NSImage(size: NSSize(width: 22, height: 22), flipped: false) { _ in
+            func point(_ x: CGFloat, _ y: CGFloat) -> NSPoint { NSPoint(x: x, y: descending ? 22 - y : y) }
+            let path = NSBezierPath()
+            path.move(to: point(4, 4)); path.line(to: point(18, 18))
+            path.move(to: point(4, 10)); path.line(to: point(4, 4)); path.line(to: point(10, 4))
+            path.move(to: point(12, 18)); path.line(to: point(18, 18)); path.line(to: point(18, 12))
+            path.lineCapStyle = .round; path.lineJoinStyle = .round
+            NSColor.black.setStroke(); path.lineWidth = 4; path.stroke()
+            NSColor.white.setStroke(); path.lineWidth = 1.8; path.stroke()
+            return true
+        }
+        return NSCursor(image: image, hotSpot: NSPoint(x: 11, y: 11))
+    }
+    override func draw(_ dirty: NSRect) {
+        NSColor(white: 1, alpha: 0.32).setStroke()
+        func point(_ x: CGFloat, _ y: CGFloat) -> NSPoint {
+            NSPoint(x: corner.isLeft ? bounds.width - x : x, y: corner.isTop ? bounds.height - y : y)
+        }
+        // The strokes stay inside the window's rounded silhouette, with no square background.
+        for segment in [(CGFloat(2), CGFloat(6), CGFloat(12), CGFloat(16)), (6, 6, 12, 12)] {
+            let line = NSBezierPath()
+            line.move(to: point(segment.0, segment.1)); line.line(to: point(segment.2, segment.3))
+            line.lineWidth = 1.3
+            line.lineCapStyle = .round
+            line.stroke()
+        }
+    }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: corner.isLeft == corner.isTop ? Self.fallingCursor : Self.risingCursor)
+    }
+    override func mouseDown(with event: NSEvent) {
+        startPoint = NSEvent.mouseLocation
+        startSize = window?.frame.size ?? .zero
+        onBegin?()
+    }
+    override func mouseDragged(with event: NSEvent) {
+        let point = NSEvent.mouseLocation
+        onResize?(corner.desiredSize(from: startSize, delta: NSPoint(x: point.x - startPoint.x, y: point.y - startPoint.y)))
+    }
+    override func mouseUp(with event: NSEvent) { onEnd?() }
+}
+
+final class TeleprompterPanel: NSPanel, NSWindowDelegate {
+    var onClose: (() -> Void)?
+    var onEdit: (() -> Void)?
+    var onDisplayChange: ((CGDirectDisplayID?) -> Void)?
+    var currentDisplayID: CGDirectDisplayID? { effectiveScreen().flatMap(Self.displayID) }
+    private let surface = TeleprompterSurfaceView()
+    private let drag = TeleprompterDragView()
+    private let resizeHandles = TeleprompterResizeCorner.allCases.map { TeleprompterResizeView(corner: $0) }
+    private let titleLabel = NSTextField(labelWithString: L("提词器", "Teleprompter"))
+    private let privateLabel = NSTextField(labelWithString: L("不录入视频 · 拖动标题栏", "Hidden in video · drag header"))
+    private let scroll = NSScrollView()
+    private let text = TeleprompterTextView(frame: .zero)
+    private let status = NSTextField(labelWithString: "")
+    private let speedTitle = NSTextField(labelWithString: L("速度", "Speed"))
+    private let speedValue = NSTextField(labelWithString: "")
+    private let speed = NSSlider(value: 28, minValue: 8, maxValue: 72, target: nil, action: nil)
+    private let dimensions = NSView()
+    private let widthLabel = NSTextField(labelWithString: L("宽", "W"))
+    private let heightLabel = NSTextField(labelWithString: L("高", "H"))
+    private let widthField = NSTextField()
+    private let heightField = NSTextField()
+    private var applySizeButton: PillButton!
+    private var autoButton: PillButton!
+    private var resetButton: IconButton!
+    private var fontDown: PillButton!
+    private var fontUp: PillButton!
+    private var editButton: IconButton!
+    private var sizeButton: IconButton!
+    private var closeButton: IconButton!
+    private var fontSize: CGFloat = 23
+    private var autoScroll = false
+    private var recordingPaused = false
+    private var previewMode = true
+    private var reachedEnd = false
+    private var showDimensions = false
+    private var lastTick: TimeInterval?
+    private var ended = false
+    private var placed = false
+    private var geometrySave: DispatchWorkItem?
+    private var resizeAnchor: NSRect?
+    private var resizeCorner: TeleprompterResizeCorner?
+    private var resizeVisibleFrame: NSRect?
+    private var recordingDisplayID: CGDirectDisplayID?
+    private var screenObserver: NSObjectProtocol?
+    private var screenSignature = ""
+    private var lastScreenID: CGDirectDisplayID?
+    private var lastScreenUUID: String?
+    private var lastVisibleFrame: NSRect?
+    private var lastPlacedFrame: NSRect?
+    private var adjustingGeometry = false
+    private var draggingHeader = false
+    private var pendingScreenChange = false
+    private var preservePreferredPlacement = false
+    private var manualScrollUntil: TimeInterval = 0
+    private var scrollObserver: NSObjectProtocol?
+    private let minimumSize = NSSize(width: 360, height: 320)
+
+    // Only explicit numeric editing needs keyboard focus; ordinary controls never steal it.
+    override var canBecomeKey: Bool { showDimensions }
+    override var canBecomeMain: Bool { false }
+
+    init(script: String) {
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 440, height: 520),
+                   styleMask: [.nonactivatingPanel, .borderless], backing: .buffered, defer: false)
+        level = .statusBar
+        isFloatingPanel = true
+        hidesOnDeactivate = false
+        becomesKeyOnlyIfNeeded = true
+        isMovable = true
+        isMovableByWindowBackground = false
+        isReleasedWhenClosed = false
+        isOpaque = false
+        backgroundColor = .clear
+        appearance = NSAppearance(named: .darkAqua)
+        hasShadow = true
+        sharingType = chromeSharing
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        delegate = self
+        setAccessibilityLabel(L("讲解提词器，不会出现在 Blurt 录制的视频里", "Narration teleprompter, excluded from the Blurt recording"))
+
+        surface.frame = NSRect(origin: .zero, size: frame.size)
+        surface.autoresizingMask = [.width, .height]
+        contentView = surface
+        surface.addSubview(drag)
+        drag.onBegin = { [weak self] in self?.draggingHeader = true; self?.preservePreferredPlacement = false }
+        drag.onEnd = { [weak self] in
+            guard let self = self else { return }
+            self.draggingHeader = false
+            if self.pendingScreenChange { self.screenParametersChanged() }
+            self.recordCurrentScreen(); self.saveGeometry()
+        }
+        drag.setAccessibilityLabel(L("拖动标题栏可移动提词器", "Drag the header to move the teleprompter"))
+        titleLabel.font = .systemFont(ofSize: 16, weight: .semibold)
+        titleLabel.textColor = .white
+        privateLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        privateLabel.textColor = NSColor(white: 1, alpha: 0.55)
+        for field in [titleLabel, privateLabel] {
+            field.lineBreakMode = .byTruncatingTail
+            drag.addSubview(field)
+        }
+        editButton = icon("pencil", L("编辑提词内容", "Edit script"), #selector(editScript))
+        sizeButton = icon("arrow.up.left.and.arrow.down.right", L("设置宽度和高度；也可拖动四个角", "Set width and height, or drag any corner"), #selector(toggleDimensions))
+        closeButton = icon("xmark", L("关闭提词器（录制继续）", "Hide teleprompter (recording continues)"), #selector(hidePrompter))
+        for button in [editButton!, sizeButton!, closeButton!] { surface.addSubview(button) }
+
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        scroll.borderType = .noBorder
+        scroll.scrollerStyle = .overlay
+        scroll.contentView.drawsBackground = false
+        text.isEditable = false
+        text.isSelectable = false
+        text.isRichText = false
+        text.drawsBackground = false
+        text.textColor = .white
+        text.isVerticallyResizable = true
+        text.isHorizontallyResizable = false
+        text.autoresizingMask = .width
+        text.textContainerInset = NSSize(width: 4, height: 12)
+        text.textContainer?.widthTracksTextView = true
+        text.textContainer?.lineFragmentPadding = 2
+        text.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        text.string = script
+        text.setAccessibilityLabel(L("讲解逐字稿", "Narration script"))
+        scroll.documentView = text
+        surface.addSubview(scroll)
+
+        autoButton = PillButton(L("自动滚动", "Auto-scroll"), symbol: "play.fill", fill: accent,
+                                target: self, action: #selector(toggleAuto))
+        autoButton.setAccessibilityLabel(L("开启或停止自动滚动", "Start or stop automatic scrolling"))
+        resetButton = icon("arrow.counterclockwise", L("回到稿件开头", "Back to the beginning"), #selector(resetToTop))
+        fontDown = PillButton("A−", fill: NSColor(white: 1, alpha: 0.10), target: self, action: #selector(decreaseFont))
+        fontUp = PillButton("A+", fill: NSColor(white: 1, alpha: 0.10), target: self, action: #selector(increaseFont))
+        fontDown.toolTip = L("减小字号", "Decrease text size")
+        fontUp.toolTip = L("增大字号", "Increase text size")
+        for button in [autoButton!, resetButton!, fontDown!, fontUp!] { surface.addSubview(button) }
+
+        speed.target = self
+        speed.action = #selector(changeSpeed)
+        speed.isContinuous = true
+        speed.setAccessibilityLabel(L("自动滚动速度", "Automatic scrolling speed"))
+        speedTitle.font = .systemFont(ofSize: 11, weight: .medium)
+        speedTitle.textColor = NSColor(white: 1, alpha: 0.55)
+        speedValue.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        speedValue.textColor = .white
+        speedValue.alignment = .right
+        status.font = .systemFont(ofSize: 11, weight: .medium)
+        status.textColor = NSColor(white: 1, alpha: 0.55)
+        status.lineBreakMode = .byTruncatingTail
+        for view in [speedTitle, speed, speedValue, status] { surface.addSubview(view) }
+
+        for label in [widthLabel, heightLabel] {
+            label.font = .systemFont(ofSize: 11, weight: .medium)
+            label.textColor = NSColor(white: 1, alpha: 0.65)
+            dimensions.addSubview(label)
+        }
+        for field in [widthField, heightField] {
+            field.isBezeled = false
+            field.isBordered = false
+            field.drawsBackground = true
+            field.backgroundColor = NSColor(white: 0.17, alpha: 1)
+            field.textColor = .white
+            field.font = .monospacedDigitSystemFont(ofSize: 13, weight: .medium)
+            field.alignment = .center
+            field.focusRingType = .none
+            field.wantsLayer = true
+            field.layer?.cornerRadius = 7
+            field.layer?.masksToBounds = true
+            field.target = self
+            field.action = #selector(applyDimensions)
+            dimensions.addSubview(field)
+        }
+        widthField.setAccessibilityLabel(L("提词器宽度，单位为屏幕点", "Teleprompter width in screen points"))
+        heightField.setAccessibilityLabel(L("提词器高度，单位为屏幕点", "Teleprompter height in screen points"))
+        applySizeButton = PillButton(L("应用", "Apply"), fill: NSColor(white: 1, alpha: 0.12), target: self, action: #selector(applyDimensions))
+        dimensions.addSubview(applySizeButton)
+        dimensions.isHidden = true
+        surface.addSubview(dimensions)
+        for handle in resizeHandles {
+            let corner = handle.corner
+            handle.toolTip = corner.label + L(" · 拖动调整大小", " · Drag to resize")
+            handle.setAccessibilityLabel(handle.toolTip)
+            handle.onBegin = { [weak self] in
+                guard let self = self else { return }
+                self.resizeAnchor = self.frame; self.resizeCorner = corner
+                self.resizeVisibleFrame = self.effectiveScreen()?.visibleFrame.insetBy(dx: 12, dy: 12)
+                self.preservePreferredPlacement = false
+            }
+            handle.onResize = { [weak self] size in self?.resizePanel(to: size) }
+            handle.onEnd = { [weak self] in
+                guard let self = self else { return }
+                self.resizeAnchor = nil; self.resizeCorner = nil; self.resizeVisibleFrame = nil
+                if self.pendingScreenChange { self.screenParametersChanged() }
+                self.recordCurrentScreen(); self.saveGeometry()
+            }
+            surface.addSubview(handle)
+        }
+
+        if let saved = recordConfig()["narration_font_size"] as? Double, saved.isFinite {
+            fontSize = CGFloat(min(45, max(17, saved)))
+        }
+        if let saved = recordConfig()["narration_scroll_speed"] as? Double, saved.isFinite {
+            speed.doubleValue = min(speed.maxValue, max(speed.minValue, saved))
+        }
+        scrollObserver = NotificationCenter.default.addObserver(forName: NSScrollView.didLiveScrollNotification,
+                                                                 object: scroll, queue: .main) { [weak self] _ in
+            self?.manualScrollUntil = ProcessInfo.processInfo.systemUptime + 1.5
+        }
+        screenSignature = Self.currentScreenSignature()
+        screenObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                                                 object: nil, queue: .main) { [weak self] _ in
+            self?.screenParametersChanged()
+        }
+        surface.onLayout = { [weak self] in self?.layoutPanel() }
+        layoutPanel()
+        refreshSpeed()
+        applyFont()
+        refreshStatus()
+    }
+
+    private func icon(_ symbol: String, _ tip: String, _ action: Selector) -> IconButton {
+        let button = IconButton(symbol: symbol, tip: tip, target: self, action: action)
+        button.setAccessibilityLabel(tip)
+        return button
+    }
+
+    private func layoutPanel() {
+        let w = surface.bounds.width, h = surface.bounds.height
+        guard w > 0, h > 0 else { return }
+        drag.frame = NSRect(x: 0, y: h - 66, width: w, height: 66)
+        titleLabel.frame = NSRect(x: 20, y: 32, width: max(1, w - 152), height: 21)
+        privateLabel.frame = NSRect(x: 20, y: 13, width: max(1, w - 152), height: 16)
+        editButton.frame.origin = NSPoint(x: w - 122, y: h - 47)
+        sizeButton.frame.origin = NSPoint(x: w - 86, y: h - 47)
+        closeButton.frame.origin = NSPoint(x: w - 50, y: h - 47)
+        let textBottom: CGFloat = showDimensions ? 171 : 127
+        scroll.frame = NSRect(x: 16, y: textBottom, width: w - 32, height: max(1, h - textBottom - 66))
+        autoButton.frame = NSRect(x: 20, y: 78, width: 140, height: 34)
+        resetButton.frame.origin = NSPoint(x: 168, y: 79)
+        fontDown.frame = NSRect(x: w - 114, y: 78, width: 43, height: 34)
+        fontUp.frame = NSRect(x: w - 63, y: 78, width: 43, height: 34)
+        speedTitle.frame = NSRect(x: 20, y: 49, width: 40, height: 16)
+        speed.frame = NSRect(x: 66, y: 45, width: w - 149, height: 24)
+        speedValue.frame = NSRect(x: w - 74, y: 49, width: 54, height: 16)
+        status.frame = NSRect(x: 20, y: 20, width: w - 63, height: 16)
+        dimensions.frame = NSRect(x: 20, y: 124, width: w - 40, height: 34)
+        widthLabel.frame = NSRect(x: 0, y: 9, width: 20, height: 17)
+        widthField.frame = NSRect(x: 25, y: 3, width: 71, height: 27)
+        heightLabel.frame = NSRect(x: 109, y: 9, width: 20, height: 17)
+        heightField.frame = NSRect(x: 135, y: 3, width: 71, height: 27)
+        applySizeButton.frame = NSRect(x: dimensions.bounds.width - 76, y: 1, width: 76, height: 32)
+        // 18pt targets meet, but never overlap, the header buttons and title labels.
+        for handle in resizeHandles {
+            handle.frame = NSRect(x: handle.corner.isLeft ? 0 : w - 18,
+                                  y: handle.corner.isTop ? h - 18 : 0, width: 18, height: 18)
+        }
+        sizeText()
+        surface.needsDisplay = true
+    }
+
+    static func preferredDisplayID(fallback: CGDirectDisplayID?) -> CGDirectDisplayID? {
+        let saved = recordConfig()["narration_panel_position"] as? [String: Any] ?? [:]
+        if let uuid = saved["display_uuid"] as? String {
+            if let found = NSScreen.screens.first(where: { displayUUID($0) == uuid }) { return displayID(found) }
+            // A disconnected UUID must not accidentally resolve to a reused numeric ID.
+        } else {
+            if let oldID = (saved["display_id"] as? NSNumber)?.uint32Value,
+               let found = NSScreen.screens.first(where: { displayID($0) == oldID }) { return displayID(found) }
+            if let x = saved["x"] as? Double, let y = saved["y"] as? Double, x.isFinite, y.isFinite,
+               let found = NSScreen.screens.first(where: { $0.frame.contains(NSPoint(x: x, y: y)) }) { return displayID(found) }
+        }
+        if let fallback = fallback, NSScreen.screens.contains(where: { displayID($0) == fallback }) { return fallback }
+        return (NSScreen.main ?? NSScreen.screens.first).flatMap(displayID)
+    }
+
+    static func rememberPreferredDisplay(_ id: CGDirectDisplayID) {
+        guard let target = NSScreen.screens.first(where: { displayID($0) == id }) else { return }
+        let saved = recordConfig()["narration_panel_position"] as? [String: Any] ?? [:]
+        let visible = target.visibleFrame.insetBy(dx: 12, dy: 12)
+        let size = NSSize(width: min(visible.width, max(360, savedDimension(saved["width"], fallback: 440))),
+                          height: min(visible.height, max(320, savedDimension(saved["height"], fallback: 520))))
+        let frame = NSRect(x: visible.maxX - size.width, y: visible.maxY - size.height, width: size.width, height: size.height)
+        setRecordConfig("narration_panel_position", geometryRecord(frame, on: target))
+    }
+
+    func move(to displayID: CGDirectDisplayID) {
+        guard let target = NSScreen.screens.first(where: { Self.displayID($0) == displayID }) else { return }
+        let visible = target.visibleFrame.insetBy(dx: 12, dy: 12)
+        let size = boundedSize(frame.size, in: visible)
+        preservePreferredPlacement = false
+        screenSignature = Self.currentScreenSignature()
+        applyPlacement(NSRect(x: visible.maxX - size.width, y: visible.maxY - size.height, width: size.width, height: size.height))
+        placed = true
+        recordCurrentScreen(forceNotify: true); saveGeometry()
+    }
+
+    func place(near region: CGRect) {
+        guard !placed else { return }
+        let r = toNS(region)
+        guard let recordingScreen = NSScreen.screens.max(by: {
+            let a = $0.frame.intersection(r), b = $1.frame.intersection(r)
+            return (a.isNull ? 0 : a.width * a.height) < (b.isNull ? 0 : b.width * b.height)
+        }) else { return }
+        recordingDisplayID = Self.displayID(recordingScreen)
+        let selected = Self.preferredDisplayID(fallback: recordingDisplayID)
+        let target = NSScreen.screens.first(where: { Self.displayID($0) == selected }) ?? recordingScreen
+        let saved = recordConfig()["narration_panel_position"] as? [String: Any] ?? [:]
+        let visible = target.visibleFrame.insetBy(dx: 12, dy: 12)
+        let size = boundedSize(NSSize(width: Self.savedDimension(saved["width"], fallback: 440),
+                                      height: Self.savedDimension(saved["height"], fallback: 520)), in: visible)
+        let savedUUID = saved["display_uuid"] as? String
+        let matches = savedUUID.map { $0 == Self.displayUUID(target) } ?? true
+        preservePreferredPlacement = savedUUID != nil && !matches
+        let topRight = NSPoint(x: visible.maxX - size.width, y: visible.maxY - size.height)
+        var origin = topRight
+        if matches {
+            if let x = saved["relative_x"] as? Double, let y = saved["relative_y"] as? Double, x.isFinite, y.isFinite {
+                origin = Self.restoredOrigin(NSPoint(x: x, y: y), size: size, visible: visible)
+            } else if let x = saved["x"] as? Double, let y = saved["y"] as? Double, x.isFinite, y.isFinite {
+                origin = NSPoint(x: max(visible.minX, min(x, visible.maxX - size.width)),
+                                 y: max(visible.minY, min(y, visible.maxY - size.height)))
+            }
+        }
+        screenSignature = Self.currentScreenSignature()
+        applyPlacement(NSRect(origin: origin, size: size))
+        resetToTop()
+        placed = true
+        recordCurrentScreen()
+    }
+
+    private static func savedDimension(_ value: Any?, fallback: CGFloat) -> CGFloat {
+        guard let value = value as? Double, value.isFinite, value > 0 else { return fallback }
+        return CGFloat(value)
+    }
+    private static func displayID(_ screen: NSScreen) -> CGDirectDisplayID? {
+        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+    }
+    private static func displayUUID(_ screen: NSScreen) -> String? {
+        guard let id = displayID(screen), let uuid = CGDisplayCreateUUIDFromDisplayID(id) else { return nil }
+        return CFUUIDCreateString(nil, uuid.takeRetainedValue()) as String
+    }
+    private static func relativeOrigin(_ frame: NSRect, visible: NSRect) -> NSPoint {
+        NSPoint(x: visible.width > frame.width ? max(0, min(1, (frame.minX - visible.minX) / (visible.width - frame.width))) : 1,
+                y: visible.height > frame.height ? max(0, min(1, (frame.minY - visible.minY) / (visible.height - frame.height))) : 1)
+    }
+    private static func restoredOrigin(_ relative: NSPoint, size: NSSize, visible: NSRect) -> NSPoint {
+        NSPoint(x: visible.minX + max(0, visible.width - size.width) * max(0, min(1, relative.x)),
+                y: visible.minY + max(0, visible.height - size.height) * max(0, min(1, relative.y)))
+    }
+    private static func geometryRecord(_ frame: NSRect, on screen: NSScreen) -> [String: Any] {
+        let relative = relativeOrigin(frame, visible: screen.visibleFrame.insetBy(dx: 12, dy: 12))
+        var saved: [String: Any] = ["x": Double(frame.minX), "y": Double(frame.minY),
+                                   "width": Double(frame.width), "height": Double(frame.height),
+                                   "relative_x": Double(relative.x), "relative_y": Double(relative.y)]
+        if let id = displayID(screen) { saved["display_id"] = Int(id) }
+        if let uuid = displayUUID(screen) { saved["display_uuid"] = uuid }
+        return saved
+    }
+    private static func currentScreenSignature() -> String {
+        NSScreen.screens.map { "\(displayID($0) ?? 0):\($0.frame):\($0.visibleFrame)" }.sorted().joined(separator: "|")
+    }
+    private func effectiveScreen() -> NSScreen? {
+        NSScreen.screens.filter { $0.frame.intersects(frame) }.max {
+            let a = $0.frame.intersection(frame), b = $1.frame.intersection(frame)
+            return a.width * a.height < b.width * b.height
+        }
+    }
+    private func applyPlacement(_ newFrame: NSRect) {
+        adjustingGeometry = true
+        setFrame(newFrame, display: true)
+        layoutPanel(); refreshDimensionFields()
+        adjustingGeometry = false
+    }
+    private func recordCurrentScreen(forceNotify: Bool = false) {
+        guard placed, !adjustingGeometry, screenSignature == Self.currentScreenSignature() else { return }
+        let current = effectiveScreen()
+        let id = current.flatMap(Self.displayID)
+        let changed = id != lastScreenID
+        lastScreenID = id
+        lastScreenUUID = current.flatMap(Self.displayUUID)
+        lastVisibleFrame = current?.visibleFrame.insetBy(dx: 12, dy: 12)
+        lastPlacedFrame = frame
+        if changed || forceNotify { onDisplayChange?(id) }
+    }
+    private func screenParametersChanged() {
+        guard placed, screenSignature != Self.currentScreenSignature() else { return }
+        guard !draggingHeader, resizeAnchor == nil else { pendingScreenChange = true; return }
+        pendingScreenChange = false
+        let previousFrame = lastPlacedFrame ?? frame
+        let stillPresent = NSScreen.screens.first { Self.displayUUID($0) == lastScreenUUID }
+        let fallback = NSScreen.screens.first { Self.displayID($0) == recordingDisplayID } ?? NSScreen.main ?? NSScreen.screens.first
+        guard let target = stillPresent ?? fallback else { return }
+        let visible = target.visibleFrame.insetBy(dx: 12, dy: 12)
+        let size = boundedSize(previousFrame.size, in: visible)
+        let origin: NSPoint
+        if stillPresent != nil, let oldVisible = lastVisibleFrame {
+            origin = Self.restoredOrigin(Self.relativeOrigin(previousFrame, visible: oldVisible), size: size, visible: visible)
+        } else {
+            preservePreferredPlacement = true
+            origin = NSPoint(x: visible.maxX - size.width, y: visible.maxY - size.height)
+        }
+        screenSignature = Self.currentScreenSignature()
+        applyPlacement(NSRect(origin: origin, size: size))
+        recordCurrentScreen()
+        if !preservePreferredPlacement { saveGeometry() }
+    }
+    private func boundedSize(_ size: NSSize, in visible: NSRect) -> NSSize {
+        NSSize(width: min(visible.width, max(minimumSize.width, size.width)),
+               height: min(visible.height, max(minimumSize.height, size.height)))
+    }
+    private func resizePanel(to desiredSize: NSSize) {
+        guard desiredSize.width.isFinite, desiredSize.height.isFinite,
+              let screen = screen ?? NSScreen.main else { return }
+        let visible = resizeVisibleFrame ?? screen.visibleFrame.insetBy(dx: 12, dy: 12)
+        let newFrame: NSRect
+        if let anchor = resizeAnchor, let corner = resizeCorner {
+            newFrame = corner.resizedFrame(from: anchor, to: desiredSize, in: visible, minimum: minimumSize)
+        } else {
+            // Numeric width/height edits may reposition the whole window to keep it onscreen.
+            let size = boundedSize(desiredSize, in: visible)
+            let origin = NSPoint(x: max(visible.minX, min(frame.minX, visible.maxX - size.width)),
+                                 y: max(visible.minY, min(frame.maxY - size.height, visible.maxY - size.height)))
+            newFrame = NSRect(origin: origin, size: size)
+        }
+        setFrame(newFrame, display: true)
+        layoutPanel()
+        refreshDimensionFields()
+        scheduleGeometrySave()
+    }
+    private func refreshDimensionFields() {
+        widthField.stringValue = String(Int(frame.width.rounded()))
+        heightField.stringValue = String(Int(frame.height.rounded()))
+    }
+    func windowDidMove(_ notification: Notification) { recordCurrentScreen(); scheduleGeometrySave() }
+    func windowDidChangeScreen(_ notification: Notification) { recordCurrentScreen(); scheduleGeometrySave() }
+    func windowDidResize(_ notification: Notification) { layoutPanel(); recordCurrentScreen(); scheduleGeometrySave() }
+    private func scheduleGeometrySave() {
+        guard placed, !adjustingGeometry, screenSignature == Self.currentScreenSignature() else { return }
+        geometrySave?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.saveGeometry() }
+        geometrySave = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
+    }
+    private func saveGeometry() {
+        guard placed, !preservePreferredPlacement, screenSignature == Self.currentScreenSignature(),
+              frame.origin.x.isFinite, frame.origin.y.isFinite, let target = effectiveScreen() else { return }
+        setRecordConfig("narration_panel_position", Self.geometryRecord(frame, on: target))
+    }
+
+    func setScript(_ script: String) {
+        guard text.string != script else { return }
+        let oldLimit = max(0, text.bounds.height - scroll.contentView.bounds.height)
+        let fraction = oldLimit > 0 ? scroll.contentView.bounds.minY / oldLimit : 0
+        text.string = script
+        applyFont()
+        let limit = max(0, text.bounds.height - scroll.contentView.bounds.height)
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: min(limit, max(0, fraction * limit))))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        reachedEnd = false
+        lastTick = nil
+        refreshStatus()
+    }
+    func setPreviewMode(_ isPreview: Bool) {
+        previewMode = isPreview
+        recordingPaused = false
+        lastTick = nil
+        refreshStatus()
+    }
+    // The owner's preview/HUD timer drives this in both modes. Hidden panels do not advance.
+    func update(paused: Bool) {
+        guard !ended else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let dt = min(0.25, max(0, now - (lastTick ?? now)))
+        lastTick = now
+        let justResumed = recordingPaused && !paused
+        recordingPaused = paused
+        refreshStatus()
+        guard isVisible, autoScroll, !paused, !justResumed, now >= manualScrollUntil else { return }
+        let clip = scroll.contentView
+        let limit = max(0, text.bounds.height - clip.bounds.height)
+        let y = min(limit, max(0, clip.bounds.minY) + CGFloat(dt * speed.doubleValue))
+        clip.scroll(to: NSPoint(x: 0, y: y))
+        scroll.reflectScrolledClipView(clip)
+        if y >= limit { autoScroll = false; reachedEnd = true; refreshStatus() }
+    }
+    func stopScrolling() {
+        ended = true
+        autoScroll = false
+        lastTick = nil
+        geometrySave?.cancel()
+        geometrySave = nil
+        saveGeometry()
+        if let observer = scrollObserver { NotificationCenter.default.removeObserver(observer); scrollObserver = nil }
+    }
+
+    private func refreshStatus() {
+        autoButton.title = autoScroll ? L("暂停滚动", "Pause scroll") : L("自动滚动", "Auto-scroll")
+        autoButton.image = NSImage(systemSymbolName: autoScroll ? "pause.fill" : "play.fill", accessibilityDescription: autoButton.title)
+        autoButton.fill = autoScroll ? NSColor(white: 1, alpha: 0.15) : accent
+        autoButton.needsDisplay = true
+        status.textColor = recordingPaused ? amber : NSColor(white: 1, alpha: 0.55)
+        let mode = previewMode ? L("预览", "Preview") : L("录制中", "Recording")
+        if recordingPaused {
+            status.stringValue = autoScroll ? L("录制已暂停 · 滚动同步暂停", "Recording paused · scrolling paused")
+                                             : L("录制已暂停 · 可手动滚动", "Recording paused · scroll manually")
+        } else if reachedEnd {
+            status.stringValue = mode + L(" · 已到稿件末尾", " · End of script")
+        } else {
+            status.stringValue = mode + (autoScroll ? L(" · 自动滚动中，可手动调整", " · Auto-scrolling, or scroll manually")
+                                                     : L(" · 手动滚动，或开启自动滚动", " · Scroll manually, or start Auto-scroll"))
+        }
+    }
+    private func sizeText() {
+        let width = max(1, scroll.contentSize.width)
+        let oldY = scroll.contentView.bounds.minY
+        text.setFrameSize(NSSize(width: width, height: max(1, text.frame.height)))
+        guard let container = text.textContainer, let layout = text.layoutManager else { return }
+        container.containerSize = NSSize(width: max(1, width - text.textContainerInset.width * 2), height: CGFloat.greatestFiniteMagnitude)
+        layout.ensureLayout(for: container)
+        let height = max(scroll.contentSize.height, ceil(layout.usedRect(for: container).height) + text.textContainerInset.height * 2)
+        text.setFrameSize(NSSize(width: width, height: height))
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: min(max(0, height - scroll.contentSize.height), max(0, oldY))))
+        scroll.reflectScrolledClipView(scroll.contentView)
+    }
+    private func applyFont() {
+        let oldLimit = max(0, text.bounds.height - scroll.contentView.bounds.height)
+        let fraction = oldLimit > 0 ? scroll.contentView.bounds.minY / oldLimit : 0
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 9
+        paragraph.paragraphSpacing = 15
+        text.textStorage?.setAttributes([.font: NSFont.systemFont(ofSize: fontSize, weight: .medium),
+                                        .foregroundColor: NSColor.white, .paragraphStyle: paragraph],
+                                       range: NSRange(location: 0, length: (text.string as NSString).length))
+        sizeText()
+        let limit = max(0, text.bounds.height - scroll.contentView.bounds.height)
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: min(limit, max(0, fraction * limit))))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        fontDown.isEnabled = fontSize > 17
+        fontUp.isEnabled = fontSize < 45
+        fontDown.alphaValue = fontDown.isEnabled ? 1 : 0.35
+        fontUp.alphaValue = fontUp.isEnabled ? 1 : 0.35
+    }
+    @objc private func toggleAuto() {
+        autoScroll.toggle()
+        reachedEnd = false
+        lastTick = nil
+        manualScrollUntil = 0
+        refreshStatus()
+    }
+    @objc private func resetToTop() {
+        reachedEnd = false
+        scroll.contentView.scroll(to: .zero)
+        scroll.reflectScrolledClipView(scroll.contentView)
+        lastTick = nil
+        refreshStatus()
+    }
+    @objc private func decreaseFont() { fontSize = max(17, fontSize - 2); applyFont(); setRecordConfig("narration_font_size", Double(fontSize)) }
+    @objc private func increaseFont() { fontSize = min(45, fontSize + 2); applyFont(); setRecordConfig("narration_font_size", Double(fontSize)) }
+    private func refreshSpeed() { speedValue.stringValue = String(format: "%.1f×", speed.doubleValue / 28) }
+    @objc private func changeSpeed() { refreshSpeed(); setRecordConfig("narration_scroll_speed", speed.doubleValue) }
+    @objc private func editScript() { onEdit?() }
+    @objc private func toggleDimensions() {
+        showDimensions.toggle()
+        dimensions.isHidden = !showDimensions
+        sizeButton.tint = showDimensions ? accent : .white
+        if !showDimensions { makeFirstResponder(nil); resignKey() }
+        refreshDimensionFields()
+        layoutPanel()
+    }
+    @objc private func applyDimensions() {
+        guard let width = Double(widthField.stringValue), let height = Double(heightField.stringValue), width.isFinite, height.isFinite else {
+            refreshDimensionFields(); return
+        }
+        makeFirstResponder(nil)
+        preservePreferredPlacement = false
+        resizePanel(to: NSSize(width: width, height: height))
+        saveGeometry()
+    }
+    @objc private func hidePrompter() {
+        makeFirstResponder(nil)
+        saveGeometry()
+        orderOut(nil)
+        lastTick = nil
+        onClose?()
+    }
+    func windowShouldClose(_ sender: NSWindow) -> Bool { hidePrompter(); return false }
+    deinit {
+        if let observer = screenObserver { NotificationCenter.default.removeObserver(observer) }
+        geometrySave?.cancel()
+        if let observer = scrollObserver { NotificationCenter.default.removeObserver(observer) }
+    }
+}
+
+
+// MARK: - Live recording preview (no writer, microphone, or saved frames)
+
+final class RecordingPreview: NSObject, SCStreamOutput, SCStreamDelegate {
+    var displayID: CGDirectDisplayID?
+    var expectedDisplayFrame: CGRect?
+    private var stream: SCStream?
+    private var stopped = false
+    private var starting = false
+    private let queue = DispatchQueue(label: "blurt.preview")
+    private let context = CIContext()
+    var onImage: ((NSImage) -> Void)?
+    var onError: ((String) -> Void)?
+
+    func start(region: CGRect) {
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { [weak self] content, error in
+            DispatchQueue.main.async {
+                guard let self = self, !self.stopped else { return }
+                guard let content = content else {
+                    self.fail(error?.localizedDescription ?? L("无法读取屏幕预览，请检查录屏权限。", "Screen preview unavailable. Check Screen Recording permission.")); return
+                }
+                let center = CGPoint(x: region.midX, y: region.midY)
+                guard let display = content.displays.first(where: { display in
+                    self.displayID.map { display.displayID == $0 } ?? display.frame.contains(center)
+                }) else {
+                    self.fail(L("所选屏幕已断开，请重新选择录制区域。", "The selected display is unavailable. Choose another area.")); return
+                }
+                let clipped = region.intersection(display.frame)
+                guard self.expectedDisplayFrame == nil || self.expectedDisplayFrame == display.frame else {
+                    self.fail(L("屏幕布局已变化，请重新预览后录制。", "Display layout changed. Refresh the preview before recording.")); return
+                }
+                guard !clipped.isNull, clipped.width >= 8, clipped.height >= 8, clipped == region else {
+                    self.fail(L("录制区域无效，请重新选择。", "Choose a valid recording area.")); return
+                }
+                let mine = content.applications.filter { $0.processID == getpid() }
+                guard !mine.isEmpty else {
+                    self.fail(L("暂时无法排除 Blurt 窗口，请重试预览。", "Could not exclude Blurt's windows. Retry the preview.")); return
+                }
+                let filter = SCContentFilter(display: display, excludingApplications: mine, exceptingWindows: [])
+                let cfg = SCStreamConfiguration()
+                let ratio = min(1, 1100 / clipped.width)
+                cfg.width = max(2, Int(clipped.width * ratio) / 2 * 2)
+                cfg.height = max(2, Int(clipped.height * ratio) / 2 * 2)
+                cfg.sourceRect = CGRect(x: clipped.minX - display.frame.minX, y: clipped.minY - display.frame.minY,
+                                        width: clipped.width, height: clipped.height)
+                cfg.minimumFrameInterval = CMTime(value: 1, timescale: 6)
+                cfg.queueDepth = 3
+                cfg.pixelFormat = kCVPixelFormatType_32BGRA
+                cfg.showsCursor = true
+                cfg.capturesAudio = false
+                if #available(macOS 15.0, *) { cfg.captureMicrophone = false }
+                let s = SCStream(filter: filter, configuration: cfg, delegate: self)
+                do {
+                    try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.queue)
+                    self.stream = s
+                    self.starting = true
+                    s.startCapture { [weak self] error in
+                        DispatchQueue.main.async {
+                            guard let self = self else { s.stopCapture { _ in }; return }
+                            self.starting = false
+                            if self.stopped { s.stopCapture { _ in }; self.stream = nil; return }
+                            if let error = error { self.fail(error.localizedDescription) }
+                        }
+                    }
+                } catch { self.fail(error.localizedDescription) }
+            }
+        }
+    }
+
+    func stop() {
+        stopped = true
+        onImage = nil
+        onError = nil
+        if !starting { stream?.stopCapture { _ in }; stream = nil }
+    }
+
+    private func fail(_ message: String) {
+        guard !stopped else { return }
+        let callback = onError
+        stop()
+        callback?(message)
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        DispatchQueue.main.async { [weak self] in self?.fail(error.localizedDescription) }
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer buffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard !stopped, type == .screen, buffer.isValid,
+              let attachments = CMSampleBufferGetSampleAttachmentsArray(buffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let raw = attachments.first?[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete,
+              let pixels = CMSampleBufferGetImageBuffer(buffer) else { return }
+        let image = CIImage(cvPixelBuffer: pixels)
+        guard let cg = context.createCGImage(image, from: image.extent) else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, !self.stopped else { return }
+            self.onImage?(NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height)))
+        }
+    }
+}
+
 // MARK: - Recorder
 
 func audioInputDevices() -> [AVCaptureDevice] {
@@ -722,6 +2285,8 @@ func audioInputDevices() -> [AVCaptureDevice] {
 
 final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     let region: CGRect
+    let recordingDisplayID: CGDirectDisplayID?
+    let recordingDisplayFrame: CGRect?
     var stream: SCStream?
     var writer: AVAssetWriter!
     var vIn: AVAssetWriterInput!
@@ -746,10 +2311,46 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudio
     var frames = 0
     var audioBuffers = 0
     var onRestart: (() -> Void)?
+    var teleprompter: TeleprompterPanel?
+    var captureError: Error?
+    var startingCapture = false
+    var pendingStop: (discard: Bool, restart: Bool)?
+    var onPrompterChanged: ((Bool) -> Void)?
+    var onEditNarration: (() -> Void)?
+    var onPrompterDisplayChanged: ((CGDirectDisplayID?) -> Void)?
 
-    init(region: CGRect) { self.region = region }
+    init(region: CGRect) {
+        self.region = region
+        recordingDisplayID = opts.narrationScript == nil ? nil : opts.recordingDisplayID
+        recordingDisplayFrame = opts.narrationScript == nil ? nil : opts.recordingDisplayFrame
+    }
 
     var isPaused: Bool { pausedAt != nil }
+    var prompterVisible: Bool { teleprompter?.isVisible == true }
+
+    func setPrompterEnabled(_ enabled: Bool, notify: Bool = true) {
+        guard opts.narrationScript != nil, !stopping else { return }
+        opts.prompterEnabled = enabled
+        if enabled {
+            if teleprompter == nil {
+                let panel = TeleprompterPanel(script: opts.narrationScript ?? "")
+                panel.onDisplayChange = { [weak self] id in self?.onPrompterDisplayChanged?(id) }
+                panel.place(near: region)
+                panel.setPreviewMode(false)
+                panel.onClose = { [weak self] in self?.setPrompterEnabled(false) }
+                panel.onEdit = { [weak self] in self?.onEditNarration?() }
+                teleprompter = panel
+            }
+            teleprompter?.orderFrontRegardless()
+        } else { teleprompter?.orderOut(nil) }
+        if notify { onPrompterChanged?(enabled) }
+    }
+
+    func updateNarration(script: String, enabled: Bool) {
+        opts.narrationScript = script
+        teleprompter?.setScript(script)
+        setPrompterEnabled(enabled, notify: false)
+    }
 
     func elapsed() -> Double {
         guard sessionStart.isValid else { return 0 }
@@ -769,8 +2370,10 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudio
 
     // --- setup
     func prepare(completion: @escaping (Error?) -> Void) {
+        if opts.narrationScript != nil { setPrompterEnabled(opts.prompterEnabled, notify: false) }
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { content, err in
             DispatchQueue.main.async {
+                guard !self.stopping else { return }
                 guard let content = content else { return completion(err ?? NSError(domain: "blurt", code: 1)) }
                 do { try self.configure(content); completion(nil) } catch { completion(error) }
             }
@@ -779,12 +2382,28 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudio
 
     func configure(_ content: SCShareableContent) throws {
         let center = CGPoint(x: region.midX, y: region.midY)
-        guard let display = content.displays.first(where: { $0.frame.contains(center) }) ?? content.displays.first else {
-            throw NSError(domain: "blurt", code: 2, userInfo: [NSLocalizedDescriptionKey: "no display"])
+        guard let display = content.displays.first(where: { display in
+            recordingDisplayID.map { display.displayID == $0 } ?? display.frame.contains(center)
+        }) else {
+            throw NSError(domain: "blurt", code: 2, userInfo: [NSLocalizedDescriptionKey:
+                L("所选屏幕已断开，请重新选择录制区域。", "The selected display is unavailable. Choose another area.")])
         }
         let clipped = region.intersection(display.frame)
-        let mine = content.windows.filter { $0.owningApplication?.processID == getpid() }
-        let filter = SCContentFilter(display: display, excludingWindows: mine)
+        guard recordingDisplayFrame == nil || recordingDisplayFrame == display.frame else {
+            throw NSError(domain: "blurt", code: 2, userInfo: [NSLocalizedDescriptionKey:
+                L("屏幕布局已变化，请重新预览后录制。", "Display layout changed. Refresh the preview before recording.")])
+        }
+        guard !clipped.isNull, !clipped.isInfinite, clipped.width >= 8, clipped.height >= 8, clipped == region else {
+            throw NSError(domain: "blurt", code: 2, userInfo: [NSLocalizedDescriptionKey:
+                L("录制区域无效，请重新选择。", "Choose a valid recording area.")])
+        }
+        // Window IDs are a snapshot: they do not protect a HUD, prompt or dialog created later.
+        let mine = content.applications.filter { $0.processID == getpid() }
+        guard !mine.isEmpty else {
+            throw NSError(domain: "blurt", code: 6, userInfo: [NSLocalizedDescriptionKey:
+                L("无法安全排除提词窗，请重新打开 Blurt 后再试。", "Could not exclude Blurt's windows safely. Reopen Blurt and try again.")])
+        }
+        let filter = SCContentFilter(display: display, excludingApplications: mine, exceptingWindows: [])
         let cfg = SCStreamConfiguration()
         let scale = NSScreen.screens.first(where: {
             ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == display.displayID
@@ -865,13 +2484,23 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudio
 
     // --- run
     func start() {
-        stream?.startCapture { err in
-            if let err = err {
-                DispatchQueue.main.async { sessionEnded(3, ["event": "error", "code": "capture", "message": err.localizedDescription]) }
+        guard !stopping, let stream = stream else { return }
+        startingCapture = true
+        stream.startCapture { err in
+            DispatchQueue.main.async {
+                self.startingCapture = false
+                if let err = err { self.captureError = err }
+                if let pending = self.pendingStop {
+                    self.pendingStop = nil
+                    self.stop(discard: pending.discard, restart: pending.restart)
+                } else if err != nil {
+                    self.stop()
+                } else if !self.stopping {
+                    self.captureSession?.startRunning()
+                    self.showChrome()
+                }
             }
         }
-        captureSession?.startRunning()
-        DispatchQueue.main.async { self.showChrome() }
     }
 
     func showChrome() {
@@ -881,9 +2510,12 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudio
         hud = HUD(rec: self)
         hud.place(near: region)
         hud.orderFrontRegardless()
-        ticker = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+        // Keep moving text smooth; the ordinary feedback HUD only needs five updates per second.
+        let interval = opts.narrationScript == nil ? 0.2 : 1.0 / 30.0
+        ticker = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             self.hud.update(elapsed: self.elapsed(), paused: self.isPaused, level: self.micLevel)
+            self.teleprompter?.update(paused: self.isPaused || !self.started || !self.prompterVisible)
             self.borderView.color = self.isPaused ? amber : accent
         }
         cursorTicker = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
@@ -959,8 +2591,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudio
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        emit(["event": "error", "code": "stream_stopped", "message": error.localizedDescription])
-        DispatchQueue.main.async { self.stop() }
+        DispatchQueue.main.async { self.captureError = error; self.stop() }
     }
 
     // AVCapture (macOS < 15 mic)
@@ -975,10 +2606,11 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudio
     }
 
     func handleVideo(_ sb: CMSampleBuffer) {
+        guard !stopping, captureError == nil else { return }
         if !started {
             let pts = CMSampleBufferGetPresentationTimeStamp(sb)
             guard writer.startWriting() else {
-                emit(["event": "error", "code": "writer", "message": writer.error?.localizedDescription ?? "?"])
+                failWriting()
                 return
             }
             writer.startSession(atSourceTime: pts)
@@ -991,15 +2623,32 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudio
         if vIn.append(s) {
             frames += 1
             lastVideo = CMSampleBufferGetPresentationTimeStamp(s)
-        }
+        } else { failWriting() }
     }
 
     func handleAudio(_ sb: CMSampleBuffer) {
+        guard !stopping, captureError == nil else { return }
         micLevel = rms(sb)
         guard started, !isPaused, let a = aIn else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sb)
         guard CMTimeCompare(pts, sessionStart) >= 0, let s = adjusted(sb), a.isReadyForMoreMediaData else { return }
-        if a.append(s) { audioBuffers += 1 }
+        if a.append(s) { audioBuffers += 1 } else { failWriting() }
+    }
+
+    func failWriting() {
+        captureError = writer.error ?? NSError(domain: "blurt", code: 5,
+            userInfo: [NSLocalizedDescriptionKey: L("MP4 写入失败。", "Could not write the MP4.")])
+        DispatchQueue.main.async { self.stop() }
+    }
+
+    func cleanupChrome() {
+        ticker?.invalidate()
+        cursorTicker?.invalidate()
+        if let m = clickMonitor { NSEvent.removeMonitor(m); clickMonitor = nil }
+        hud?.orderOut(nil)
+        border?.orderOut(nil)
+        teleprompter?.stopScrolling()
+        teleprompter?.orderOut(nil)
     }
 
     func rms(_ sb: CMSampleBuffer) -> Float {
@@ -1028,32 +2677,34 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudio
 
     func stop(discard: Bool = false, restart: Bool = false) {
         guard !stopping else { return }
+        if startingCapture {
+            pendingStop = (discard, restart)
+            cleanupChrome()
+            return
+        }
         self.discard = discard
         let endAt = CMTimeSubtract(pausedAt ?? hostNow(), offset)
         stopping = true
-        ticker?.invalidate()
-        cursorTicker?.invalidate()
-        if let m = clickMonitor { NSEvent.removeMonitor(m) }
+        cleanupChrome()
         log("stop")
         try? events?.close()
-        hud?.orderOut(nil)
-        border?.orderOut(nil)
         captureSession?.stopRunning()
         let finish = {
             self.q.async {
                 guard self.started else {
+                    self.writer?.cancelWriting()
                     DispatchQueue.main.async {
+                        if discard {
+                            try? FileManager.default.removeItem(atPath: opts.out)
+                            if let e = opts.events { try? FileManager.default.removeItem(atPath: e) }
+                        }
                         if restart { emit(["event": "restarting"]); self.onRestart?(); return }
                         sessionEnded(discard ? 2 : 4, discard ? ["event": "cancelled"]
-                                     : ["event": "error", "code": "no_frames", "message": "no video frames captured"])
+                                     : ["event": "error", "code": "no_frames", "message": self.captureError?.localizedDescription ?? "no video frames captured"])
                     }
                     return
                 }
-                self.vIn.markAsFinished()
-                self.aIn?.markAsFinished()
-                // screen content may have been static at the end: extend to the real stop time
-                self.writer.endSession(atSourceTime: CMTimeMaximum(endAt, self.lastVideo))
-                self.writer.finishWriting {
+                let completed = {
                     DispatchQueue.main.async {
                         if discard {
                             try? FileManager.default.removeItem(atPath: opts.out)
@@ -1062,8 +2713,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudio
                             sessionEnded(2, ["event": "cancelled", "reason": "discarded"])
                             return
                         }
-                        if self.writer.status == .failed {
-                            sessionEnded(5, ["event": "error", "code": "writer", "message": self.writer.error?.localizedDescription ?? "?"])
+                        if self.writer.status != .completed || self.frames == 0 || self.captureError != nil {
+                            sessionEnded(5, ["event": "error", "code": "writer", "message": self.captureError?.localizedDescription ?? self.writer.error?.localizedDescription ?? "MP4 did not finish"])
                             return
                         }
                         NSSound(named: "Submarine")?.play()
@@ -1072,6 +2723,13 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudio
                                          "region": [self.region.minX, self.region.minY, self.region.width, self.region.height]])
                     }
                 }
+                // AVAssetWriter raises an Objective-C exception if finalized after cancellation/failure.
+                guard self.writer.status == .writing else { completed(); return }
+                self.vIn.markAsFinished()
+                self.aIn?.markAsFinished()
+                // Screen content may have been static at the end: extend to the real stop time.
+                self.writer.endSession(atSourceTime: CMTimeMaximum(endAt, self.lastVideo))
+                self.writer.finishWriting(completionHandler: completed)
             }
         }
         if let s = stream { s.stopCapture { _ in finish() } } else { finish() }
@@ -1233,6 +2891,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var picker: PickerController?
     var rec: Recorder?
     var countdownWin: NSWindow?
+    var countdownTimer: Timer?
+    var narrationSetup: NarrationSetupController?
+    var narrationPreview: RecordingPreview?
+    var previewPrompter: TeleprompterPanel?
+    var previewPrompterTimer: Timer?
+    var narrationRegion: CGRect?
+    var narrationRecordingDisplayID: CGDirectDisplayID?
+    var narrationPrompterDisplayID: CGDirectDisplayID?
+    var narrationLocalRegion: CGRect?
+    var narrationFullDisplay = false
+    var narrationScreenObserver: NSObjectProtocol?
     var statusItem: NSStatusItem?
     var busy = false                 // picking / counting down / recording
     var processing: [String] = []    // sessions being processed by an agent
@@ -1325,11 +2994,21 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func begin(_ region: CGRect) {
+        cancelCountdown()
+        stopNarrationPreview()
         busy = true
         emit(["event": "selected", "region": [region.minX, region.minY, region.width, region.height]])
         saveLastRegion(region)
         opts.lastRegion = region
         let r = Recorder(region: region)
+        if opts.narrationScript != nil {
+            r.onEditNarration = { [weak self] in self?.showNarrationControls() }
+            r.onPrompterChanged = { [weak self] enabled in self?.narrationSetup?.setPrompterEnabled(enabled) }
+            r.onPrompterDisplayChanged = { [weak self] id in
+                self?.narrationPrompterDisplayID = id
+                self?.refreshNarrationDisplays()
+            }
+        }
         r.onRestart = { [weak self] in
             FileManager.default.createFile(atPath: opts.events ?? "/dev/null", contents: nil)
             self?.rec = nil
@@ -1337,11 +3016,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         rec = r
         r.prepare { err in
+            guard self.rec === r, !r.stopping else { return }
             if let err = err {
                 sessionEnded(3, ["event": "error", "code": "setup", "message": err.localizedDescription])
                 return
             }
-            self.countdown(opts.countdown, over: region) { r.start() }
+            if opts.narrationScript != nil { self.narrationSetup?.hideForRegionSelection() }
+            self.countdown(opts.countdown, over: region) {
+                guard self.rec === r, !r.stopping else { return }
+                r.start()
+            }
         }
     }
 
@@ -1357,16 +3041,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         v.n = left
         emit(["event": "countdown", "n": left])
         NSSound(named: "Pop")?.play()
-        var timer: Timer?
         let go = {
             guard !fired else { return }
             fired = true                 // a short beat after hiding so the countdown never lands in frame 1
-            timer?.invalidate()
+            self.countdownTimer?.invalidate()
+            self.countdownTimer = nil
+            v.onSkip = nil
             w.orderOut(nil)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { then() }
         }
         v.onSkip = go
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { t in
+        countdownTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { t in
             left -= 1
             if left == 0 {
                 go()
@@ -1379,6 +3064,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: menu-bar app
+
+    func cancelCountdown() {
+        countdownTimer?.invalidate()
+        countdownTimer = nil
+        (countdownWin?.contentView as? CountdownView)?.onSkip = nil
+        countdownWin?.orderOut(nil)
+        countdownWin = nil
+    }
 
     func startResident() {
         ensureDefaultWorkspace()
@@ -1397,10 +3090,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             emit(event)
             self?.takeEnded(code, event)
         }
-        // A second launch (double-click the app again) → start recording in the running instance
+        // A second launch restores the current setup or opens a recording preview.
         DistributedNotificationCenter.default().addObserver(forName: .init("dev.blurt.recorder.start"), object: nil, queue: .main) { [weak self] _ in
-            guard let self = self, !self.busy else { return }
-            self.startRecording(useLast: false)
+            self?.reopenResident()
         }
         if recordConfig()["welcomed"] == nil {
             setRecordConfig("welcomed", true)
@@ -1411,8 +3103,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let i = args.firstIndex(of: "--process"), i + 1 < args.count {
             let agent = args.firstIndex(of: "--agent").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } ?? "claude"
             process(URL(fileURLWithPath: args[i + 1]), with: agent)
+        } else if args.contains("--narrate") {
+            mNarration()
         } else if !args.contains("--background") {
-            startRecording(useLast: false)
+            mNarration()
         }
     }
 
@@ -1425,12 +3119,28 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if resident && !busy { startRecording(useLast: false) }
+        reopenResident()
         return false
     }
 
-    func startRecording(useLast: Bool) {
+    func reopenResident() {
+        guard resident else { return }
+        if narrationSetup != nil { showNarrationControls(); return }
+        if !busy { mNarration() }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        stopNarrationPreview()
+        closePreviewPrompter()
+        narrationSetup?.cancel()   // Flush any pending draft edit before the app exits.
+    }
+
+    func startRecording(useLast: Bool, narrationScript: String? = nil) {
         guard !busy else { return }
+        opts.narrationScript = narrationScript
+        opts.recordingDisplayID = nil
+        opts.recordingDisplayFrame = nil
+        opts.mic = true
         let dir = newSessionDir()
         opts.out = dir.appendingPathComponent("recording.mp4").path
         opts.events = dir.appendingPathComponent("events.jsonl").path
@@ -1442,6 +3152,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 if err != nil {
                     self.busy = false
+                    opts.narrationScript = nil
                     try? FileManager.default.removeItem(at: dir)
                     self.permissionHelp()
                     return
@@ -1452,14 +3163,26 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func takeEnded(_ code: Int32, _ event: [String: Any]) {
+        if opts.narrationScript != nil, let setup = narrationSetup {
+            opts.narrationScript = setup.scriptValue
+        }
+        cancelCountdown()
+        closeNarrationControls()
+        rec?.cleanupChrome()
         rec = nil
         busy = false
         picker = nil
+        let narrationScript = opts.narrationScript
+        opts.narrationScript = nil
         guard let dir = lastSession else { return }
         if code != 0 {
-            try? FileManager.default.removeItem(at: dir)       // cancelled / failed take: leave no empty folder
+            let video = dir.appendingPathComponent("recording.mp4")
+            let size = (try? video.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            let keepPartial = code != 2 && size > 0
+            if !keepPartial { try? FileManager.default.removeItem(at: dir) }
             if event["event"] as? String == "error" {
-                alert(L("录制失败", "Recording failed"), event["message"] as? String ?? "")
+                let recovery = keepPartial ? L("\n未完成的录制文件已保留：\n", "\nThe unfinished recording has been preserved at:\n") + dir.path : ""
+                alert(L("录制失败", "Recording failed"), (event["message"] as? String ?? "") + recovery)
             }
             refreshStatus()
             return
@@ -1470,12 +3193,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "started_at": ISO8601DateFormatter().string(from: Date(timeIntervalSinceNow: -dur)),
             "author": recordConfig()["author"] as? String ?? NSFullUserName(),
             "workspace": currentWorkspace().path,
+            "mode": narrationScript == nil ? "feedback" : "narration",
         ]
         if let d = try? JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted, .sortedKeys]) {
             try? d.write(to: dir.appendingPathComponent("meta.json"))
         }
+        if let script = narrationScript {
+            try? script.write(to: dir.appendingPathComponent("script.txt"), atomically: true, encoding: .utf8)
+            saveNarration(dir, duration: dur)
+            refreshStatus()
+            return
+        }
         let mode = recordConfig()["process"] as? String ?? "off"
         if mode == "off" {
+            openHistory(dir)
             toast(L("已保存 \(fmtDur(dur)) 的录屏 · 在菜单里可以拷贝发给同事，或让 agent 处理", "Saved a \(fmtDur(dur)) recording · copy it from the menu or let your agent process it"))
         } else {
             process(dir, with: mode)
@@ -1483,9 +3214,47 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshStatus()
     }
 
+    /// Keep the original take even if the presenter cancels exporting or the chosen disk is unavailable.
+    func saveNarration(_ dir: URL, duration: Double) {
+        busy = true
+        defer { busy = false }
+        let source = dir.appendingPathComponent("recording.mp4")
+        let panel = NSSavePanel()
+        panel.title = L("保存讲解视频", "Save narration video")
+        panel.message = L("MP4 已自动保存在录制文件夹中，可另存到你选择的位置。", "Your MP4 is already saved in the recording folder. Save a copy wherever you prefer.")
+        panel.allowedContentTypes = [.mpeg4Movie]
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = "Blurt-\(dir.lastPathComponent).mp4"
+        panel.directoryURL = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first
+        activateApp()
+        guard panel.runModal() == .OK, let destination = panel.url else {
+            NSWorkspace.shared.activateFileViewerSelecting([source])
+            toast(L("MP4 已保存在录制文件夹 · \(fmtDur(duration))", "MP4 saved in the recording folder · \(fmtDur(duration))"))
+            return
+        }
+        do {
+            if source.standardizedFileURL != destination.standardizedFileURL {
+                let temporary = destination.deletingLastPathComponent().appendingPathComponent(".blurt-export-\(UUID().uuidString).mp4")
+                defer { try? FileManager.default.removeItem(at: temporary) }
+                try FileManager.default.copyItem(at: source, to: temporary)
+                if FileManager.default.fileExists(atPath: destination.path) {
+                    _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary)
+                } else {
+                    try FileManager.default.moveItem(at: temporary, to: destination)
+                }
+            }
+            NSWorkspace.shared.activateFileViewerSelecting([destination])
+            toast(L("讲解视频已保存为 MP4 · \(fmtDur(duration))", "Narration saved as MP4 · \(fmtDur(duration))"))
+        } catch {
+            alert(L("另存失败，原视频已保留", "Could not export; original video is safe"), error.localizedDescription + "\n" + source.path)
+            NSWorkspace.shared.activateFileViewerSelecting([source])
+        }
+    }
+
     /// Hand the recording to a coding agent in the workspace, headless. It writes the outputs next to the recording
     /// and opens the review page itself.
     func process(_ dir: URL, with agent: String) {
+        guard !processing.contains(dir.path) else { openHistory(dir); return }
         let ws = currentWorkspace()
         let name = agent == "codex" ? "Codex" : "Claude Code"
         guard let bin = findExecutable(agent == "codex" ? "codex" : "claude") else {
@@ -1503,16 +3272,21 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             cmd = "\(shq(bin)) -p \(shq(prompt)) --permission-mode acceptEdits --allowedTools Bash Read Write Edit Glob Grep"
         }
+        let oldLog = dir.appendingPathComponent("agent.log")
+        if FileManager.default.fileExists(atPath: oldLog.path) {
+            try? FileManager.default.moveItem(at: oldLog, to: dir.appendingPathComponent("agent-\(Int(Date().timeIntervalSince1970)).log"))
+        }
+        writeProcessing(dir, status: "running", agent: agent)
         processing.append(dir.path)
+        openHistory(dir)
         toast(L("\(name) 正在后台整理…", "\(name) is processing it in the background…"))
         shell(cmd, cwd: ws, log: dir.appendingPathComponent("agent.log")) { [weak self] status in
             guard let self = self else { return }
             self.processing.removeAll { $0 == dir.path }
             let ok = status == 0 && FileManager.default.fileExists(atPath: dir.appendingPathComponent("items.json").path)
-            if ok && self.openReview(dir) {
-                self.toast(L("整理好了，审核页已打开", "Done — the review page is open"))
-            } else if ok {
-                self.toast(L("整理好了（items.json 已生成）", "Done — items.json is ready"))
+            self.writeProcessing(dir, status: ok ? "completed" : "failed", agent: agent, code: status)
+            if ok {
+                self.toast(L("整理好了，请在处理记录页审核", "Ready to review in workflow history"))
             } else {
                 self.toast(L("后台整理失败，详见录屏文件夹里的 agent.log", "Processing failed — see agent.log in the recording folder"))
             }
@@ -1521,12 +3295,37 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshStatus()
     }
 
+    func writeProcessing(_ dir: URL, status: String, agent: String, code: Int32? = nil) {
+        var state = ((try? Data(contentsOf: dir.appendingPathComponent("processing.json")))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }) ?? [:]
+        state["status"] = status
+        state["agent"] = agent
+        state["pid"] = ProcessInfo.processInfo.processIdentifier
+        state["updated"] = Date().timeIntervalSince1970
+        if status == "running" { state["started"] = Date().timeIntervalSince1970; state.removeValue(forKey: "exit_code") }
+        if let c = code { state["exit_code"] = c }
+        if let data = try? JSONSerialization.data(withJSONObject: state) {
+            try? data.write(to: dir.appendingPathComponent("processing.json"), options: .atomic)
+        }
+    }
+
+    func openHistory(_ dir: URL? = nil) {
+        guard let skill = readConfig()["skill_dir"] as? String, let uv = findExecutable("uv") else { return }
+        let session = dir.map { " --session " + shq($0.path) } ?? ""
+        shell("\(shq(uv)) run -q \(shq("\(skill)/scripts/history.py"))\(session)", cwd: currentWorkspace(),
+              log: configURL.deletingLastPathComponent().appendingPathComponent("history-launch.log")) { _ in }
+    }
+    @objc func mHistory() { openHistory() }
+    @objc func mSessionHistory(_ it: NSMenuItem) {
+        if let p = it.representedObject as? String { openHistory(URL(fileURLWithPath: p)) }
+    }
+
     /// Open the review page ourselves (the agent has exited; a page it started could die with it).
     @discardableResult
     func openReview(_ dir: URL) -> Bool {
         guard let skill = readConfig()["skill_dir"] as? String,
               FileManager.default.fileExists(atPath: "\(skill)/scripts/review.py"), let uv = findExecutable("uv") else { return false }
-        shell("\(shq(uv)) run -q \(shq("\(skill)/scripts/review.py")) \(shq(dir.path))", cwd: dir,
+        shell("history_url=$(\(shq(uv)) run -q \(shq("\(skill)/scripts/history.py")) --no-open --session \(shq(dir.path))); \(shq(uv)) run -q \(shq("\(skill)/scripts/review.py")) \(shq(dir.path)) --history-url \"$history_url\"", cwd: dir,
               log: dir.appendingPathComponent("review.log")) { _ in }
         return true
     }
@@ -1572,13 +3371,26 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return it
         }
         if let r = rec {
+            if narrationSetup != nil {
+                _ = add(L("录制设置与讲稿…", "Recording controls and script…"), #selector(mNarration))
+                _ = add(r.prompterVisible ? L("关闭提词器", "Hide teleprompter") : L("显示提词器", "Show teleprompter"), #selector(mTogglePrompter))
+                menu.addItem(.separator())
+            }
             _ = add(L("完成录制", "Finish recording") + "   ⌥⇧S", #selector(mStop))
             _ = add((r.isPaused ? L("继续", "Resume") : L("暂停", "Pause")) + "   ⌥⇧P", #selector(mPause))
             _ = add(L("重新录制", "Restart"), #selector(mRestart))
             _ = add(L("放弃这次录制", "Discard"), #selector(mDiscard))
             return
         }
-        if busy { _ = add(L("正在选择区域…", "Selecting an area…"), nil); return }
+        if narrationSetup != nil {
+            _ = add(L("录制讲解视频（带提词）…", "Record narration with teleprompter…"), #selector(mNarration))
+            _ = add(L("取消本次讲解准备", "Cancel narration setup"), #selector(mCancelNarration))
+            menu.addItem(.separator())
+            _ = add(L("退出口喷鸡", "Quit blurt"), #selector(mQuit), key: "q")
+            return
+        }
+        if busy { _ = add(L("正在准备或保存录制…", "Preparing or saving recording…"), nil); return }
+        _ = add(L("录制讲解视频（带提词）…", "Record narration with teleprompter…"), #selector(mNarration))
         _ = add(L("开始录制", "Start recording") + "   ⌥⇧R", #selector(mStart))
         if lastRegionFromConfig() != nil { _ = add(L("录制上次的区域", "Record the last area"), #selector(mStartLast)) }
         menu.addItem(.separator())
@@ -1598,6 +3410,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         wsItem.submenu = wsMenu
         menu.addItem(wsItem)
 
+        _ = add(L("处理记录与结果…", "Workflow history…"), #selector(mHistory))
         let recents = recentSessions()
         let rItem = NSMenuItem(title: L("最近的录制", "Recent recordings"), action: nil, keyEquivalent: "")
         let rMenu = NSMenu()
@@ -1610,6 +3423,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let pretty = name.count >= 15 ? "\(name.dropFirst(4).prefix(2))/\(name.dropFirst(6).prefix(2)) \(name.dropFirst(9).prefix(2)):\(name.dropFirst(11).prefix(2))" : name
             let it = NSMenuItem(title: "\(pretty)  ·  \(dur)\(done ? "  ✓" : "")\(processing.contains(d.path) ? "  …" : "")", action: nil, keyEquivalent: "")
             let sub = NSMenu()
+            _ = add(L("查看处理进度与结果", "View progress and results"), #selector(mSessionHistory(_:)), to: sub, obj: d.path)
             _ = add(L("拷贝视频（粘贴发给同事）", "Copy video (paste to share)"), #selector(mCopyVideo(_:)), to: sub, obj: d.path)
             _ = add(L("在访达中显示", "Show in Finder"), #selector(mReveal(_:)), to: sub, obj: d.path)
             _ = add(L("让 Claude Code 整理", "Process with Claude Code"), #selector(mProcessClaude(_:)), to: sub, obj: d.path)
@@ -1645,6 +3459,311 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func mStart() { startRecording(useLast: false) }
+    @objc func mNarration() {
+        if narrationSetup != nil { showNarrationControls(); return }
+        guard !busy else { return }
+        busy = true
+        let setup = NarrationSetupController()
+        narrationSetup = setup
+        setup.onCancel = { [weak self] in
+            guard let self = self, self.rec == nil else { return }
+            self.closeNarrationControls()
+            self.busy = false
+        }
+        setup.onStart = { [weak self] region, script, enabled, microphone in
+            self?.startNarrationRecording(region: region, script: script, enabled: enabled, microphone: microphone)
+        }
+        setup.onChooseRegion = { [weak self] in self?.chooseNarrationRegion() }
+        setup.onSelectFullScreen = { [weak self] in self?.selectNarrationFullScreen() }
+        setup.onSelectRecordingDisplay = { [weak self] id in self?.selectNarrationRecordingDisplay(id) }
+        setup.onSelectPrompterDisplay = { [weak self] id in self?.selectNarrationPrompterDisplay(id) }
+        setup.onRetryPreview = { [weak self] in
+            guard let self = self, let region = self.narrationRegion else { return }
+            self.startNarrationPreview(region)
+        }
+        setup.onPrompterChange = { [weak self] script, enabled in
+            guard let self = self else { return }
+            if let recorder = self.rec { recorder.updateNarration(script: script, enabled: enabled) }
+            else { self.updatePreviewPrompter(script: script, enabled: enabled) }
+        }
+        setup.onFinish = { [weak self] in self?.command("stop") }
+        setup.onHide = { [weak self] in self?.stopNarrationPreview() }
+        narrationScreenObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                                                         object: nil, queue: .main) { [weak self] _ in
+            self?.narrationScreensChanged()
+        }
+        setup.show()
+        let screens = NSScreen.screens
+        let underPointer = screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? screens.first
+        guard let screen = underPointer else { setup.cancel(); return }
+        let config = recordConfig()
+        let savedUUID = config["narration_recording_display_uuid"] as? String
+        let savedScreen = screens.first { savedUUID != nil && narrationDisplayUUID(narrationDisplayID($0)) == savedUUID }
+        let candidate = savedScreen.flatMap { restoredNarrationRegion(on: $0) } ?? (savedUUID == nil ? lastRegionFromConfig() : nil)
+        let validScreen = candidate.flatMap { r in screens.first { toCG($0.frame).contains(CGPoint(x: r.midX, y: r.midY)) } }
+        let initial = candidate.flatMap { r in validScreen.map { r.intersection(toCG($0.frame)) } }
+        let region = (initial != nil && initial!.width >= 8 && initial!.height >= 8) ? initial! : toCG((savedScreen ?? screen).frame)
+        setNarrationRegion(region)
+        narrationPrompterDisplayID = TeleprompterPanel.preferredDisplayID(fallback: narrationRecordingDisplayID)
+        refreshNarrationDisplays()
+        updatePreviewPrompter(script: setup.scriptValue, enabled: setup.prompterEnabled)
+    }
+
+    @objc func mCancelNarration() { narrationSetup?.cancel() }
+    @objc func mTogglePrompter() { if let r = rec { r.setPrompterEnabled(!r.prompterVisible) } }
+
+    func showNarrationControls() {
+        guard let setup = narrationSetup else { return }
+        if let picker = picker { picker.finish(false); return }
+        setup.show()
+        if let r = rec {
+            setup.setRecordingMode(true)
+            startNarrationPreview(r.region)
+        } else if let region = narrationRegion {
+            if narrationPreview == nil { startNarrationPreview(region) }
+            updatePreviewPrompter(script: setup.scriptValue, enabled: setup.prompterEnabled)
+        }
+        refreshNarrationDisplays()
+    }
+
+    func restoredNarrationRegion(on screen: NSScreen) -> CGRect? {
+        let display = toCG(screen.frame)
+        guard let saved = recordConfig()["narration_region_on_display"] as? [String: Any],
+              saved["display_uuid"] as? String == narrationDisplayUUID(narrationDisplayID(screen)) else { return display }
+        if saved["full_screen"] as? Bool == true { return display }
+        guard let x = saved["x"] as? Double, let y = saved["y"] as? Double,
+              let width = saved["width"] as? Double, let height = saved["height"] as? Double,
+              [x, y, width, height].allSatisfy({ $0.isFinite }) else { return display }
+        let region = CGRect(x: display.minX + x, y: display.minY + y, width: width, height: height).intersection(display)
+        return !region.isNull && region.width >= 8 && region.height >= 8 ? region : display
+    }
+
+    func refreshNarrationDisplays() {
+        guard let setup = narrationSetup else { return }
+        let screens = NSScreen.screens
+        let options = screens.enumerated().map { index, screen -> NarrationDisplayOption in
+            let id = narrationDisplayID(screen)
+            let name = CGDisplayIsBuiltin(id) != 0 ? L("内建显示屏", "Built-in display") : screen.localizedName
+            let duplicate = screens.filter { $0.localizedName == screen.localizedName }.count > 1
+            return NarrationDisplayOption(id: id, title: name + (duplicate ? " (\(index + 1))" : ""))
+        }
+        if let actual = rec?.teleprompter?.currentDisplayID ?? previewPrompter?.currentDisplayID {
+            narrationPrompterDisplayID = actual
+        } else if narrationScreen(narrationPrompterDisplayID) == nil {
+            narrationPrompterDisplayID = TeleprompterPanel.preferredDisplayID(fallback: narrationRecordingDisplayID)
+        }
+        setup.setDisplayOptions(options, recording: narrationRecordingDisplayID, prompter: narrationPrompterDisplayID)
+    }
+
+    func selectNarrationRecordingDisplay(_ id: CGDirectDisplayID) {
+        guard rec == nil, let screen = narrationScreen(id) else { return }
+        setNarrationRegion(toCG(screen.frame))
+        // Choosing what to capture must never move the user's prompter on another screen.
+        refreshNarrationDisplays()
+    }
+
+    func selectNarrationPrompterDisplay(_ id: CGDirectDisplayID) {
+        guard narrationScreen(id) != nil else { return }
+        narrationPrompterDisplayID = id
+        TeleprompterPanel.rememberPreferredDisplay(id)
+        if let recorder = rec { recorder.teleprompter?.move(to: id) }
+        else { previewPrompter?.move(to: id) }
+        refreshNarrationDisplays()
+    }
+
+    func setNarrationRegion(_ requested: CGRect) {
+        guard let screen = NSScreen.screens.first(where: { toCG($0.frame).contains(CGPoint(x: requested.midX, y: requested.midY)) }) else { return }
+        let display = toCG(screen.frame)
+        let region = requested.integral.intersection(display)
+        guard !region.isNull, region.width >= 8, region.height >= 8 else { return }
+        narrationRecordingDisplayID = narrationDisplayID(screen)
+        narrationRegion = region
+        narrationLocalRegion = region.offsetBy(dx: -display.minX, dy: -display.minY)
+        narrationFullDisplay = region == display
+        if let uuid = narrationDisplayUUID(narrationDisplayID(screen)), let local = narrationLocalRegion {
+            setRecordConfig("narration_recording_display_uuid", uuid)
+            setRecordConfig("narration_region_on_display", ["display_uuid": uuid, "x": local.minX, "y": local.minY,
+                                                            "width": local.width, "height": local.height, "full_screen": region == display])
+        }
+        narrationSetup?.setRegion(region, label: "\(screen.localizedName) · \(Int(region.width)) × \(Int(region.height))")
+        refreshNarrationDisplays()
+        startNarrationPreview(region)
+    }
+
+    func selectNarrationFullScreen() {
+        guard rec == nil, let screen = narrationScreen(narrationRecordingDisplayID) else { return }
+        setNarrationRegion(toCG(screen.frame))
+    }
+
+    func narrationScreensChanged() {
+        guard let setup = narrationSetup else { return }
+        if let picker = picker {
+            picker.onDone = nil
+            picker.finish(false)
+            self.picker = nil
+            unregisterHotkey(.pickEnter); unregisterHotkey(.pickEsc); unregisterHotkey(.pickFull)
+            setup.show()
+        }
+        if let recorder = rec {
+            refreshNarrationDisplays()
+            guard let screen = narrationScreen(recorder.recordingDisplayID),
+                  recorder.recordingDisplayFrame == toCG(screen.frame) else {
+                stopNarrationPreview()
+                cancelCountdown()
+                toast(L("录制屏幕连接或布局已变化，正在结束本次录制。", "Recording display changed. Finishing the current take."))
+                recorder.stop()
+                return
+            }
+            return
+        }
+        stopNarrationPreview()
+        guard let screen = narrationScreen(narrationRecordingDisplayID) else {
+            narrationRegion = nil
+            setup.setRegion(.zero, label: L("录制屏幕已断开", "Recording display disconnected"))
+            setup.setPreviewStatus(L("请选择一块已连接的录制屏幕。", "Choose a connected display to record."), error: true)
+            refreshNarrationDisplays()
+            return
+        }
+        let display = toCG(screen.frame)
+        let region = narrationFullDisplay ? display : (narrationLocalRegion.map { $0.offsetBy(dx: display.minX, dy: display.minY).intersection(display) } ?? display)
+        setNarrationRegion(!region.isNull && region.width >= 8 && region.height >= 8 ? region : display)
+        updatePreviewPrompter(script: setup.scriptValue, enabled: setup.prompterEnabled)
+    }
+
+    func chooseNarrationRegion() {
+        guard rec == nil, let setup = narrationSetup, picker == nil,
+              narrationScreen(narrationRecordingDisplayID) != nil else { return }
+        stopNarrationPreview()
+        setup.hideForRegionSelection()
+        previewPrompter?.orderOut(nil)
+        let p = PickerController()
+        p.selectionOnly = true
+        p.targetDisplayID = narrationRecordingDisplayID
+        p.onDone = { [weak self] region in
+            guard let self = self else { return }
+            unregisterHotkey(.pickEnter); unregisterHotkey(.pickEsc); unregisterHotkey(.pickFull)
+            self.picker = nil
+            guard let setup = self.narrationSetup else { return }
+            setup.show()
+            if let region = region { self.setNarrationRegion(region) }
+            else if let previous = self.narrationRegion { self.startNarrationPreview(previous) }
+            self.updatePreviewPrompter(script: setup.scriptValue, enabled: setup.prompterEnabled)
+        }
+        picker = p
+        registerHotkey(.pickEnter, key: kVK_Return, mods: 0)
+        registerHotkey(.pickEsc, key: kVK_Escape, mods: 0)
+        registerHotkey(.pickFull, key: kVK_ANSI_F, mods: 0)
+        opts.lastRegion = narrationRegion
+        p.show(preselect: narrationRegion)
+    }
+
+    func startNarrationPreview(_ region: CGRect) {
+        stopNarrationPreview()
+        guard let setup = narrationSetup else { return }
+        setup.setPreviewStatus(L("正在预览录制画面…", "Loading the recording preview…"), error: false)
+        let preview = RecordingPreview()
+        preview.displayID = narrationRecordingDisplayID
+        preview.expectedDisplayFrame = rec?.recordingDisplayFrame ?? narrationScreen(narrationRecordingDisplayID).map { toCG($0.frame) }
+        narrationPreview = preview
+        preview.onImage = { [weak self, weak preview] image in
+            guard let self = self, let preview = preview, self.narrationPreview === preview else { return }
+            self.narrationSetup?.setPreview(image)
+        }
+        preview.onError = { [weak self, weak preview] message in
+            guard let self = self, let preview = preview, self.narrationPreview === preview else { return }
+            self.narrationSetup?.setPreviewStatus(message, error: true)
+        }
+        preview.start(region: region)
+    }
+
+    func stopNarrationPreview() {
+        narrationPreview?.stop()
+        narrationPreview = nil
+    }
+
+    func updatePreviewPrompter(script: String, enabled: Bool) {
+        guard rec == nil, let region = narrationRegion else { return }
+        if enabled {
+            if previewPrompter == nil {
+                let panel = TeleprompterPanel(script: script)
+                panel.onDisplayChange = { [weak self] id in
+                    self?.narrationPrompterDisplayID = id
+                    self?.refreshNarrationDisplays()
+                }
+                panel.setPreviewMode(true)
+                panel.place(near: region)
+                panel.onClose = { [weak self] in self?.narrationSetup?.setPrompterEnabled(false) }
+                panel.onEdit = { [weak self] in self?.showNarrationControls() }
+                previewPrompter = panel
+                refreshNarrationDisplays()
+            }
+            previewPrompter?.setScript(script)
+            previewPrompter?.orderFrontRegardless()
+            if previewPrompterTimer == nil {
+                previewPrompterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+                    guard let self = self else { return }
+                    self.previewPrompter?.update(paused: self.previewPrompter?.isVisible != true)
+                }
+            }
+        } else { previewPrompter?.orderOut(nil) }
+    }
+
+    func closePreviewPrompter() {
+        previewPrompterTimer?.invalidate()
+        previewPrompterTimer = nil
+        previewPrompter?.stopScrolling()
+        previewPrompter?.orderOut(nil)
+        previewPrompter = nil
+    }
+
+    func closeNarrationControls() {
+        if let observer = narrationScreenObserver { NotificationCenter.default.removeObserver(observer) }
+        narrationScreenObserver = nil
+        if narrationSetup != nil, let p = picker {
+            p.onDone = nil
+            p.finish(false)
+            picker = nil
+            unregisterHotkey(.pickEnter); unregisterHotkey(.pickEsc); unregisterHotkey(.pickFull)
+        }
+        stopNarrationPreview()
+        closePreviewPrompter()
+        let setup = narrationSetup
+        narrationSetup = nil
+        setup?.onCancel = nil
+        setup?.onPrompterChange = nil
+        setup?.onHide = nil
+        setup?.setRecordingMode(false)
+        setup?.cancel()
+        narrationRegion = nil
+        narrationRecordingDisplayID = nil
+        narrationPrompterDisplayID = nil
+        narrationLocalRegion = nil
+    }
+
+    func startNarrationRecording(region: CGRect, script: String, enabled: Bool, microphone: Bool) {
+        guard rec == nil, picker == nil, let setup = narrationSetup else { return }
+        guard let screen = narrationScreen(narrationRecordingDisplayID),
+              narrationRegion == region, toCG(screen.frame).contains(region) else {
+            narrationScreensChanged()
+            setup.show()
+            return
+        }
+        stopNarrationPreview()
+        closePreviewPrompter()
+        opts.narrationScript = script
+        opts.prompterEnabled = enabled
+        opts.mic = microphone
+        opts.recordingDisplayID = narrationDisplayID(screen)
+        opts.recordingDisplayFrame = toCG(screen.frame)
+        let dir = newSessionDir()
+        opts.out = dir.appendingPathComponent("recording.mp4").path
+        opts.events = dir.appendingPathComponent("events.jsonl").path
+        opts.countdown = recordConfig()["countdown"] as? Int ?? 3
+        lastSession = dir
+        narrationSetup?.setRecordingMode(true)
+        begin(region)
+    }
+
     @objc func mStartLast() { startRecording(useLast: true) }
     @objc func mStop() { command("stop") }
     @objc func mPause() { command("toggle") }

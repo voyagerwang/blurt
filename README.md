@@ -34,7 +34,29 @@ your agent does the rest:
 One recording can mix all of these. The agent decides what each item is, and teams can add their own
 [lenses](skills/blurt/reference/schema.md#custom-lenses) (e.g. `ux-research`, `sales-call`, `sop`).
 
-## Get it
+## This fork: narrated MP4 recording
+
+This fork of [AGIHunt/blurt](https://github.com/AGIHunt/blurt) adds a macOS recording preparation window, an adjustable teleprompter, and a local recording history page.
+
+Open Blurt to preview the screen, choose a display or region, edit the script, and toggle the prompter or microphone before explicitly starting. Recording and prompter displays are independent: record an external monitor while reading on another screen. Drag the prompter, resize from any corner, or enter its width and height; display, position, and size are remembered. Manual/automatic scrolling, speed, font size, and editing during a take are supported.
+
+Narration saves an H.264/AAC MP4 without automatically submitting it to an agent. Cancelling Save As keeps the original in the recording folder. Blurt excludes its own app windows from its capture, including the prompter and controls; this does not control other recording software. The original feedback recorder remains in the menu. Recording history shows processing, review, and follow-up work, with context copying and explicitly initiated follow-up tasks.
+
+Install this fork:
+
+```bash
+npx skills add voyagerwang/blurt
+```
+
+Or build from this checkout on macOS with `uv` and Xcode Command Line Tools:
+
+```bash
+uv run skills/blurt/scripts/record.py build
+```
+
+This installs `~/Applications/Blurt.app`. See [tests/README.md](tests/README.md) for isolated native checks and their limits. Automated tests use synthetic media and isolated UI; live capture exclusion, microphone capture, and physical display disconnects still need separate manual verification.
+
+## Upstream installation and feedback recording
 
 ```bash
 npx skills add AGIHunt/blurt
