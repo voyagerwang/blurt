@@ -88,7 +88,7 @@ def main() -> None:
             return true
         }
         setup.setPreview(preview)
-        for (suffix, size) in [("default", NSSize(width: 1020, height: 670)), ("min", NSSize(width: 940, height: 580))] {
+        for (suffix, size) in [("default", NSSize(width: 1020, height: 740)), ("min", NSSize(width: 940, height: 680))] {
             window.setContentSize(size)
             content.layoutSubtreeIfNeeded()
             let editor = descendants(content).compactMap { $0 as? NSScrollView }.first!

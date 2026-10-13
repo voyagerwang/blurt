@@ -150,7 +150,7 @@ for language in ["zh", "en"] {
     setup.onUseStandalone = { standaloneRequests += 1; dispatchedDraft = isolatedConfig["narration_script"] as? String ?? "" }
     setup.show()
     let prep = shownWindow(L("录制准备 · Blurt", "Recording setup · Blurt"))
-    prep.setContentSize(NSSize(width: 940, height: 580))
+    prep.setContentSize(NSSize(width: 940, height: 680))
     let prepContent = prep.contentView!
     prepContent.layoutSubtreeIfNeeded()
     let entry = descendants(prepContent).compactMap { $0 as? PillButton }.first { $0.title == L("仅用提词器", "Teleprompter only") }!

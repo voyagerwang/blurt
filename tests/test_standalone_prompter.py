@@ -18,6 +18,8 @@ import subprocess
 import sys
 import tempfile
 
+from camera_test_isolation import isolate_camera_capture, isolate_camera_panel
+
 
 def replace_method(source: str, signature: str, following: str, body: str) -> str:
     """Replace an audited method using exact adjacent boundaries; fail on drift."""
@@ -44,6 +46,7 @@ def main() -> None:
     if original.count(marker) != 1:
         raise SystemExit("Launch boundary changed; review the harness before running")
     source = original.split(marker, 1)[0]
+    source = isolate_camera_panel(isolate_camera_capture(source))
     with tempfile.TemporaryDirectory(prefix="blurt-standalone-test-") as temporary:
         root = Path(temporary)
         replacements = {

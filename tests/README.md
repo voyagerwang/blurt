@@ -1,7 +1,7 @@
 # Native narration recorder tests
 
 These standalone checks exercise the macOS narration recorder without recording
-the desktop or microphone. They require macOS, Python 3, and Xcode Command Line
+the desktop, microphone, or camera. They require macOS, Python 3, and Xcode Command Line
 Tools. They use only the Python standard library and Apple frameworks.
 
 From the repository root, run:
@@ -13,6 +13,9 @@ python3 tests/test_setup_displays.py
 python3 tests/test_floating_chrome.py
 python3 tests/test_standalone_prompter.py
 python3 tests/test_standalone_ui.py
+python3 tests/test_camera_lifecycle.py
+python3 tests/test_camera_ui.py
+python3 tests/test_camera_compositor.py
 ```
 
 Each runner reads `skills/blurt/recorder/macos/BlurtRecorder.swift`. Use `--source`
@@ -26,6 +29,22 @@ they do not add a macOS dependency to Linux smoke-test discovery.
 
 ## Coverage
 
+- `test_camera_compositor.py` passes one generated NV12 screen image and BGRA
+  camera images through the production Recorder, writes H.264 MP4, and decodes it
+  to verify circle/square shape, mirroring, aspect fill, moving/resizing/hiding
+  without stale images, static-screen camera updates, pause timing, metadata,
+  and camera-off behavior. It also checks immediate camera stop notification
+  when cancellation happens while screen capture is starting.
+- `test_camera_ui.py` checks camera controls and preview readiness in Chinese and
+  English, minimum-size layout, square/circular pixels, transparent corners,
+  dragging, all four resize handles, geometry persistence, and region clamping.
+  It renders generated images offscreen without accessing capture hardware.
+- `test_camera_lifecycle.py` checks first-frame readiness, late permission and
+  device callbacks, camera denial/disconnection, screen-only recovery, shape,
+  mirror, size, cropped and multi-display geometry, picker visibility, and camera
+  changes during a take. It checks that standalone mode never opens a remembered
+  camera, and that switching modes, final stop, and termination release the camera
+  while preserving the latest draft. Device and permission results are synthetic.
 - `test_standalone_prompter.py` exercises the real standalone entry and lifecycle,
   editing, hidden settings/panel recovery, independent visibility preferences,
   display selection, transitions to/from narration, all feedback-recording
@@ -55,11 +74,14 @@ they do not add a macOS dependency to Linux smoke-test discovery.
 ## Isolation and limits
 
 The runners extract current production code into temporary programs. Exact source
-boundaries isolate capture, microphone, window ordering, application activation,
+boundaries isolate screen/camera capture, microphone, window ordering, application activation,
 and configuration as appropriate for each test. Boundary changes cause a failure
 and require reviewing the harness. The entry test uses temporary configuration
 and workspace paths; UI tests use in-memory settings. The MP4 test uses temporary
-configuration and only generated media.
+configuration and only generated media. `camera_test_isolation.py` replaces only
+camera hardware enumeration, authorization, and capture with synthetic controls;
+it retains production compositing, geometry, and App lifecycle callbacks. All
+native lifecycle runners apply this helper before compiling their test program.
 
 No runner requests capture permission or launches the resident Blurt application.
 Window visibility in the entry/setup tests is a logical test double; raster tests
@@ -68,6 +90,7 @@ display metadata, not desktop pixels. Keyboard checks call the offscreen picker
 directly and never post system keyboard events.
 
 Passing these tests does not verify actual ScreenCaptureKit application exclusion,
-live microphone capture, cross-Space behavior, or external-display disconnects
+live microphone/camera capture, real camera permission prompts, cross-Space
+behavior, or external-display disconnects
 during a real recording. Those need a separately controlled manual test. A live
 desktop-capture integration runner is deliberately not part of this default suite.

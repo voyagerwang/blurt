@@ -15,6 +15,8 @@ import subprocess
 import sys
 import tempfile
 
+from camera_test_isolation import isolate_camera_capture, isolate_camera_panel
+
 
 def replace_method(source: str, signature: str, following: str, body: str) -> str:
     """Replace an exact audited boundary; source drift requires a manual review."""
@@ -41,6 +43,7 @@ def main() -> None:
     if marker not in source:
         raise SystemExit("Recorder extraction marker not found; review the test before running.")
     prefix = source.split(marker, 1)[0]
+    prefix = isolate_camera_panel(isolate_camera_capture(prefix))
     for signature, following in [
         ("    func start(region: CGRect) {", "    func stop() {"),
         ("    func prepare(completion: @escaping (Error?) -> Void) {", "    func configure("),

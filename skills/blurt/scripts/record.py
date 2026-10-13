@@ -229,10 +229,12 @@ INFO_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 <key>CFBundleExecutable</key><string>blurt-recorder</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.3.2</string>
+<key>CFBundleShortVersionString</key><string>0.3.3</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
 <key>NSMicrophoneUsageDescription</key><string>Blurt records your voice while you narrate feedback.</string>
+<key>NSCameraUseContinuityCameraDeviceType</key><true/>
+<key>NSCameraUsageDescription</key><string>Blurt uses your camera when you enable the camera overlay in a recording.</string>
 <key>NSScreenCaptureUsageDescription</key><string>Blurt records the screen area you select.</string>
 </dict></plist>
 """

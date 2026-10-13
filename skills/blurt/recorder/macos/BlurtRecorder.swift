@@ -951,6 +951,25 @@ final class NarrationSetupController: NSObject, NSWindowDelegate, NSTextViewDele
     var onFinish: (() -> Void)?
     var onHide: (() -> Void)?
     var onUseStandalone: (() -> Void)?
+    var onCameraChange: ((Bool, String?, Bool, Bool) -> Void)?
+    var onCameraSizeChange: ((CGFloat) -> Void)?
+
+    private(set) var cameraEnabled: Bool
+    private(set) var cameraDeviceID: String?
+    private(set) var cameraCircular: Bool
+    private(set) var cameraMirrored: Bool
+    private var cameraReady = false
+    private var cameraDevices: [(id: String, name: String)] = []
+    private var cameraMessage = L("开启后可预览人像、拖动和缩放", "Enable to preview, move and resize your camera")
+    private var cameraSizeFraction: CGFloat = 0.24
+    private var cameraSwitch: NarrationToggleButton?
+    private var cameraDeviceSelector: NSPopUpButton?
+    private var cameraShapeSelector: NSSegmentedControl?
+    private var cameraSizeSlider: NSSlider?
+    private var cameraSizeLabel: NSTextField?
+    private var cameraMirrorButton: NSButton?
+    private var cameraStatusLabel: NSTextField?
+    private var cameraRetryButton: PillButton?
 
     var scriptValue: String { editor?.string ?? savedScript }
     private(set) var prompterEnabled: Bool
@@ -995,6 +1014,12 @@ final class NarrationSetupController: NSObject, NSWindowDelegate, NSTextViewDele
         savedScript = config["narration_script"] as? String ?? ""
         prompterEnabled = config["narration_prompter_enabled"] as? Bool ?? true
         microphoneEnabled = config["narration_microphone_enabled"] as? Bool ?? true
+        cameraEnabled = config["narration_camera_enabled"] as? Bool ?? false
+        cameraDeviceID = config["narration_camera_device"] as? String
+        cameraCircular = config["narration_camera_circular"] as? Bool ?? true
+        cameraMirrored = config["narration_camera_mirrored"] as? Bool ?? true
+        let savedSize = (config["narration_camera_size"] as? NSNumber)?.doubleValue ?? 0.24
+        cameraSizeFraction = CGFloat(savedSize.isFinite ? min(0.6, max(0.12, savedSize)) : 0.24)
         super.init()
     }
 
@@ -1065,7 +1090,7 @@ final class NarrationSetupController: NSObject, NSWindowDelegate, NSTextViewDele
         recordingMode = recording
         headingLabel?.stringValue = recording ? L("录制中", "Recording") : L("录制准备", "Ready to record")
         subtitleLabel?.stringValue = recording
-            ? L("随时调整讲稿，继续专注讲解。", "Adjust your script while your recording continues.")
+            ? L("随时调整讲稿、提词器和摄像头。", "Adjust your script, prompter, or camera while recording.")
             : L("先确认画面，再开始讲解。", "Frame your screen, then tell your story.")
         window?.title = recording ? L("录制中 · Blurt", "Recording · Blurt") : L("录制准备 · Blurt", "Recording setup · Blurt")
         for button in [chooseRegionButton, fullScreenButton] {
@@ -1095,11 +1120,61 @@ final class NarrationSetupController: NSObject, NSWindowDelegate, NSTextViewDele
         onPrompterChange?(scriptValue, enabled)
     }
 
+    func setCameraDevices(_ devices: [(id: String, name: String)], selected: String?) {
+        cameraDevices = devices
+        cameraDeviceID = selected ?? devices.first?.id
+        cameraDeviceSelector?.removeAllItems()
+        let unavailable = cameraDeviceID != nil && !devices.contains(where: { $0.id == cameraDeviceID })
+        if unavailable {
+            cameraDeviceSelector?.addItem(withTitle: L("所选摄像头不可用", "Selected camera unavailable"))
+            cameraDeviceSelector?.lastItem?.representedObject = cameraDeviceID
+        } else if devices.isEmpty { cameraDeviceSelector?.addItem(withTitle: L("没有可用摄像头", "No camera available")) }
+        for device in devices {
+            cameraDeviceSelector?.addItem(withTitle: device.name)
+            cameraDeviceSelector?.lastItem?.representedObject = device.id
+        }
+        if let index = devices.firstIndex(where: { $0.id == cameraDeviceID }) { cameraDeviceSelector?.selectItem(at: index + (unavailable ? 1 : 0)) }
+        else { cameraDeviceSelector?.selectItem(at: 0) }
+        cameraDeviceSelector?.isEnabled = !devices.isEmpty
+    }
+
+    func setCameraStatus(_ message: String, ready: Bool) {
+        cameraMessage = message
+        cameraReady = ready
+        cameraStatusLabel?.stringValue = message
+        cameraStatusLabel?.textColor = cameraEnabled && !ready ? accent : NSColor(white: 1, alpha: 0.5)
+        cameraStatusLabel?.toolTip = message
+        cameraRetryButton?.isHidden = !cameraEnabled || ready
+        refreshStart()
+    }
+
+    func setCameraEnabled(_ enabled: Bool, notify: Bool = true) {
+        if cameraEnabled != enabled { cameraReady = false }
+        cameraEnabled = enabled
+        cameraSwitch?.enabledValue = enabled
+        setRecordConfig("narration_camera_enabled", enabled)
+        if !enabled { setCameraStatus(L("摄像头已关闭", "Camera off"), ready: false) }
+        else if !cameraReady { setCameraStatus(L("正在连接摄像头…", "Connecting to camera…"), ready: false) }
+        refreshStart()
+        if notify { notifyCameraChange() }
+    }
+
+    func setCameraSize(_ fraction: CGFloat) {
+        guard fraction.isFinite else { return }
+        cameraSizeFraction = min(0.6, max(0.12, fraction))
+        cameraSizeSlider?.doubleValue = Double(cameraSizeFraction)
+        cameraSizeLabel?.stringValue = "\(Int((cameraSizeFraction * 100).rounded()))%"
+    }
+
+    private func notifyCameraChange() {
+        onCameraChange?(cameraEnabled, cameraDeviceID, cameraCircular, cameraMirrored)
+    }
+
     private func buildWindow() {
-        let w = NarrationSetupWindow(contentRect: NSRect(x: 0, y: 0, width: 1020, height: 670),
+        let w = NarrationSetupWindow(contentRect: NSRect(x: 0, y: 0, width: 1020, height: 740),
                                      styleMask: [.borderless, .resizable], backing: .buffered, defer: false)
         w.title = L("录制准备 · Blurt", "Recording setup · Blurt")
-        w.minSize = NSSize(width: 940, height: 580)
+        w.minSize = NSSize(width: 940, height: 680)
         w.isReleasedWhenClosed = false
         w.isOpaque = false
         w.backgroundColor = .clear
@@ -1211,6 +1286,57 @@ final class NarrationSetupController: NSObject, NSWindowDelegate, NSTextViewDele
         let retry = button(L("重试", "Retry"), selector: #selector(retryPreview), parent: left)
         retry.isHidden = true
         retryButton = retry
+
+        let camera = NarrationToggleButton(frame: .zero)
+        camera.title = L("摄像头", "Camera")
+        camera.symbol = "video.fill"
+        camera.isBordered = false
+        camera.target = self
+        camera.action = #selector(toggleCamera)
+        camera.enabledValue = cameraEnabled
+        camera.setAccessibilityLabel(L("录制摄像头人像", "Record camera overlay"))
+        add(camera, to: left)
+        cameraSwitch = camera
+        let device = NSPopUpButton(frame: .zero, pullsDown: false)
+        device.font = .systemFont(ofSize: 12, weight: .medium)
+        device.bezelStyle = .rounded
+        device.target = self
+        device.action = #selector(changeCameraDevice)
+        device.setAccessibilityLabel(L("摄像头设备", "Camera device"))
+        add(device, to: left)
+        cameraDeviceSelector = device
+        let shape = NSSegmentedControl(labels: [L("圆形", "Circle"), L("方形", "Square")], trackingMode: .selectOne,
+                                       target: self, action: #selector(changeCameraShape))
+        shape.segmentStyle = .rounded
+        shape.selectedSegment = cameraCircular ? 0 : 1
+        shape.setAccessibilityLabel(L("摄像头形状", "Camera shape"))
+        add(shape, to: left)
+        cameraShapeSelector = shape
+        let sizeTitle = label(L("大小", "Size"), size: 11, alpha: 0.6, parent: left)
+        let size = NSSlider(value: Double(cameraSizeFraction), minValue: 0.12, maxValue: 0.6, target: self, action: #selector(changeCameraSize))
+        size.isContinuous = true
+        size.controlSize = .small
+        size.setAccessibilityLabel(L("摄像头大小，占录制区域短边的比例", "Camera size as a percentage of the recording area's shorter side"))
+        add(size, to: left)
+        cameraSizeSlider = size
+        let percent = label("", size: 11, weight: .medium, parent: left)
+        percent.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        percent.alignment = .right
+        cameraSizeLabel = percent
+        let mirror = NSButton(checkboxWithTitle: L("镜像", "Mirror"), target: self, action: #selector(changeCameraMirror))
+        mirror.font = .systemFont(ofSize: 11)
+        mirror.state = cameraMirrored ? .on : .off
+        mirror.setAccessibilityLabel(L("镜像摄像头画面和成片", "Mirror camera preview and recording"))
+        add(mirror, to: left)
+        cameraMirrorButton = mirror
+        let cameraStatus = label(cameraMessage, size: 11, alpha: 0.5, parent: left)
+        cameraStatus.maximumNumberOfLines = 1
+        cameraStatus.lineBreakMode = .byTruncatingTail
+        cameraStatusLabel = cameraStatus
+        let cameraRetry = button(L("重试", "Retry"), selector: #selector(retryCamera), parent: left)
+        cameraRetry.setAccessibilityLabel(L("重试连接摄像头", "Retry camera connection"))
+        cameraRetry.isHidden = true
+        cameraRetryButton = cameraRetry
 
         let scriptTitle = label(L("提词器", "Teleprompter"), size: 15, weight: .semibold, parent: right)
         let privateBadge = label(L("不录入视频", "Hidden in video"), size: 11, weight: .medium, alpha: 0.45, parent: right)
@@ -1334,7 +1460,7 @@ final class NarrationSetupController: NSObject, NSWindowDelegate, NSTextViewDele
             full.leadingAnchor.constraint(equalTo: previewTitle.leadingAnchor), full.topAnchor.constraint(equalTo: region.bottomAnchor, constant: 12),
             choose.leadingAnchor.constraint(equalTo: full.trailingAnchor, constant: 8), choose.centerYAnchor.constraint(equalTo: full.centerYAnchor),
             canvas.leadingAnchor.constraint(equalTo: left.leadingAnchor, constant: 14), canvas.trailingAnchor.constraint(equalTo: left.trailingAnchor, constant: -14),
-            canvas.topAnchor.constraint(equalTo: full.bottomAnchor, constant: 14), canvas.bottomAnchor.constraint(equalTo: left.bottomAnchor, constant: -47),
+            canvas.topAnchor.constraint(equalTo: full.bottomAnchor, constant: 14), canvas.bottomAnchor.constraint(equalTo: camera.topAnchor, constant: -36),
             image.leadingAnchor.constraint(equalTo: canvas.leadingAnchor), image.trailingAnchor.constraint(equalTo: canvas.trailingAnchor),
             image.topAnchor.constraint(equalTo: canvas.topAnchor), image.bottomAnchor.constraint(equalTo: canvas.bottomAnchor),
             placeholder.centerXAnchor.constraint(equalTo: canvas.centerXAnchor), placeholder.centerYAnchor.constraint(equalTo: canvas.centerYAnchor),
@@ -1346,7 +1472,25 @@ final class NarrationSetupController: NSObject, NSWindowDelegate, NSTextViewDele
             message.trailingAnchor.constraint(equalTo: placeholder.trailingAnchor),
             status.leadingAnchor.constraint(equalTo: left.leadingAnchor, constant: 17), status.centerYAnchor.constraint(equalTo: retry.centerYAnchor),
             status.trailingAnchor.constraint(lessThanOrEqualTo: retry.leadingAnchor, constant: -8),
-            retry.trailingAnchor.constraint(equalTo: left.trailingAnchor, constant: -12), retry.bottomAnchor.constraint(equalTo: left.bottomAnchor, constant: -7),
+            retry.trailingAnchor.constraint(equalTo: left.trailingAnchor, constant: -12), retry.bottomAnchor.constraint(equalTo: camera.topAnchor, constant: -1),
+            camera.leadingAnchor.constraint(equalTo: left.leadingAnchor, constant: 14),
+            camera.widthAnchor.constraint(equalToConstant: 152), camera.heightAnchor.constraint(equalToConstant: 38),
+            camera.bottomAnchor.constraint(equalTo: shape.topAnchor, constant: -12),
+            device.leadingAnchor.constraint(equalTo: camera.trailingAnchor, constant: 10), device.trailingAnchor.constraint(equalTo: left.trailingAnchor, constant: -16),
+            device.centerYAnchor.constraint(equalTo: camera.centerYAnchor), device.heightAnchor.constraint(equalToConstant: 30),
+            shape.leadingAnchor.constraint(equalTo: camera.leadingAnchor), shape.widthAnchor.constraint(equalToConstant: 142),
+            shape.heightAnchor.constraint(equalToConstant: 28), shape.bottomAnchor.constraint(equalTo: mirror.topAnchor, constant: -10),
+            sizeTitle.leadingAnchor.constraint(equalTo: shape.trailingAnchor, constant: 12), sizeTitle.widthAnchor.constraint(equalToConstant: 27),
+            sizeTitle.centerYAnchor.constraint(equalTo: shape.centerYAnchor),
+            size.leadingAnchor.constraint(equalTo: sizeTitle.trailingAnchor, constant: 8), size.centerYAnchor.constraint(equalTo: shape.centerYAnchor),
+            size.trailingAnchor.constraint(equalTo: percent.leadingAnchor, constant: -7),
+            percent.widthAnchor.constraint(equalToConstant: 33), percent.trailingAnchor.constraint(equalTo: left.trailingAnchor, constant: -16),
+            percent.centerYAnchor.constraint(equalTo: shape.centerYAnchor),
+            mirror.leadingAnchor.constraint(equalTo: camera.leadingAnchor), mirror.widthAnchor.constraint(equalToConstant: 73),
+            mirror.heightAnchor.constraint(equalToConstant: 22), mirror.bottomAnchor.constraint(equalTo: left.bottomAnchor, constant: -12),
+            cameraStatus.leadingAnchor.constraint(equalTo: mirror.trailingAnchor, constant: 10),
+            cameraStatus.trailingAnchor.constraint(equalTo: cameraRetry.leadingAnchor, constant: -8), cameraStatus.centerYAnchor.constraint(equalTo: mirror.centerYAnchor),
+            cameraRetry.trailingAnchor.constraint(equalTo: left.trailingAnchor, constant: -12), cameraRetry.centerYAnchor.constraint(equalTo: mirror.centerYAnchor),
             scriptTitle.leadingAnchor.constraint(equalTo: right.leadingAnchor, constant: 16), scriptTitle.topAnchor.constraint(equalTo: right.topAnchor, constant: 16),
             privateBadge.trailingAnchor.constraint(equalTo: right.trailingAnchor, constant: -16), privateBadge.centerYAnchor.constraint(equalTo: scriptTitle.centerYAnchor),
             toggle.leadingAnchor.constraint(equalTo: right.leadingAnchor, constant: 14), toggle.trailingAnchor.constraint(equalTo: right.trailingAnchor, constant: -14),
@@ -1378,6 +1522,9 @@ final class NarrationSetupController: NSObject, NSWindowDelegate, NSTextViewDele
         refreshCount()
         updateScriptHint()
         setDisplayOptions(displayOptions, recording: selectedRecordingDisplay, prompter: selectedPrompterDisplay)
+        setCameraDevices(cameraDevices, selected: cameraDeviceID)
+        setCameraSize(cameraSizeFraction)
+        setCameraStatus(cameraMessage, ready: cameraReady)
         region.stringValue = currentRegionLabel
         if let cached = currentPreviewImage { setPreview(cached) }
         else { setPreviewStatus(currentPreviewMessage, error: previewHasError) }
@@ -1407,7 +1554,7 @@ final class NarrationSetupController: NSObject, NSWindowDelegate, NSTextViewDele
 
     private func refreshStart() {
         let valid = !selectedRegion.isNull && !selectedRegion.isInfinite && selectedRegion.width >= 2 && selectedRegion.height >= 2
-        let enabled = !finished && (recordingMode || (previewReady && valid))
+        let enabled = !finished && (recordingMode || (previewReady && valid && (!cameraEnabled || cameraReady)))
         startButton?.title = recordingMode ? L("完成录制", "Finish recording") : L("开始录制", "Start recording")
         startButton?.image = NSImage(systemSymbolName: recordingMode ? "stop.fill" : "record.circle.fill", accessibilityDescription: nil)
         if let button = startButton {
@@ -1443,6 +1590,31 @@ final class NarrationSetupController: NSObject, NSWindowDelegate, NSTextViewDele
         microphoneSwitch?.enabledValue = microphoneEnabled
         setRecordConfig("narration_microphone_enabled", microphoneEnabled)
     }
+    @objc private func toggleCamera() { setCameraEnabled(!cameraEnabled) }
+    @objc private func retryCamera() { if cameraEnabled { notifyCameraChange() } }
+    @objc private func changeCameraDevice() {
+        guard let id = cameraDeviceSelector?.selectedItem?.representedObject as? String,
+              cameraDevices.contains(where: { $0.id == id }), id != cameraDeviceID else { return }
+        cameraDeviceID = id
+        setRecordConfig("narration_camera_device", id)
+        if cameraEnabled { setCameraStatus(L("正在切换摄像头…", "Switching camera…"), ready: false) }
+        notifyCameraChange()
+    }
+    @objc private func changeCameraShape() {
+        cameraCircular = cameraShapeSelector?.selectedSegment != 1
+        setRecordConfig("narration_camera_circular", cameraCircular)
+        notifyCameraChange()
+    }
+    @objc private func changeCameraMirror() {
+        cameraMirrored = cameraMirrorButton?.state == .on
+        setRecordConfig("narration_camera_mirrored", cameraMirrored)
+        notifyCameraChange()
+    }
+    @objc private func changeCameraSize() {
+        setCameraSize(CGFloat(cameraSizeSlider?.doubleValue ?? 0.24))
+        setRecordConfig("narration_camera_size", Double(cameraSizeFraction))
+        onCameraSizeChange?(cameraSizeFraction)
+    }
     @objc private func start() {
         if recordingMode {
             guard !finished else { return }
@@ -1452,7 +1624,7 @@ final class NarrationSetupController: NSObject, NSWindowDelegate, NSTextViewDele
             onFinish?()
             return
         }
-        guard !finished, previewReady, selectedRegion.width >= 2, selectedRegion.height >= 2,
+        guard !finished, previewReady, (!cameraEnabled || cameraReady), selectedRegion.width >= 2, selectedRegion.height >= 2,
               !selectedRegion.isNull, !selectedRegion.isInfinite else { return }
         finished = true
         flushDraft(notify: false)
@@ -2494,6 +2666,265 @@ final class TeleprompterPanel: NSPanel, NSWindowDelegate {
 }
 
 
+// MARK: - Camera overlay positioning (the recorder composites camera pixels separately)
+
+private enum CameraResizeCorner: CaseIterable {
+    case topLeft, topRight, bottomLeft, bottomRight
+    var isLeft: Bool { self == .topLeft || self == .bottomLeft }
+    var isTop: Bool { self == .topLeft || self == .topRight }
+    var label: String {
+        switch self {
+        case .topLeft: return L("左上角", "Top-left corner")
+        case .topRight: return L("右上角", "Top-right corner")
+        case .bottomLeft: return L("左下角", "Bottom-left corner")
+        case .bottomRight: return L("右下角", "Bottom-right corner")
+        }
+    }
+    func resizedFrame(from initial: NSRect, delta: NSPoint, in region: NSRect) -> NSRect {
+        let dx = isLeft ? -delta.x : delta.x
+        let dy = isTop ? delta.y : -delta.y
+        let change = abs(dx) >= abs(dy) ? dx : dy
+        let minimum = min(region.width, region.height) * 0.12
+        let maximum = min(region.width, region.height) * 0.6
+        let availableX = isLeft ? initial.maxX - region.minX : region.maxX - initial.minX
+        let availableY = isTop ? region.maxY - initial.minY : initial.maxY - region.minY
+        let side = max(0, min(availableX, availableY, maximum, max(minimum, initial.width + change)))
+        return NSRect(x: isLeft ? initial.maxX - side : initial.minX,
+                      y: isTop ? initial.minY : initial.maxY - side, width: side, height: side)
+    }
+}
+
+private final class CameraOverlaySurface: NSView {
+    var image: CGImage? { didSet { needsDisplay = true } }
+    var circular = true { didSet { needsDisplay = true } }
+    var onDrag: ((NSPoint, Bool) -> Void)?
+    var onHover: ((Bool) -> Void)?
+    private var dragStart = NSPoint.zero
+    private var tracking: NSTrackingArea?
+    override var isOpaque: Bool { false }
+    override var mouseDownCanMoveWindow: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking = tracking { removeTrackingArea(tracking) }
+        let item = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+        addTrackingArea(item); tracking = item
+    }
+    override func mouseEntered(with event: NSEvent) { onHover?(true) }
+    override func mouseExited(with event: NSEvent) { onHover?(false) }
+    override func mouseDown(with event: NSEvent) { dragStart = NSEvent.mouseLocation; onDrag?(.zero, true) }
+    override func mouseDragged(with event: NSEvent) {
+        let point = NSEvent.mouseLocation
+        onDrag?(NSPoint(x: point.x - dragStart.x, y: point.y - dragStart.y), false)
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        context.saveGState()
+        let path = circular ? CGPath(ellipseIn: bounds, transform: nil) : CGPath(rect: bounds, transform: nil)
+        context.addPath(path); context.clip()
+        context.setFillColor(NSColor(calibratedRed: 0.105, green: 0.112, blue: 0.125, alpha: 1).cgColor)
+        context.fill(bounds)
+        if let image = image {
+            let scale = max(bounds.width / CGFloat(image.width), bounds.height / CGFloat(image.height))
+            let width = CGFloat(image.width) * scale, height = CGFloat(image.height) * scale
+            context.interpolationQuality = .high
+            context.draw(image, in: CGRect(x: (bounds.width - width) / 2, y: (bounds.height - height) / 2, width: width, height: height))
+        } else {
+            let edge = min(40, bounds.width * 0.24)
+            NSImage(systemSymbolName: "video.fill", accessibilityDescription: nil)?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: edge, weight: .regular)
+                    .applying(.init(paletteColors: [NSColor(white: 1, alpha: 0.3)])))?
+                .draw(in: NSRect(x: (bounds.width - edge) / 2, y: (bounds.height - edge) / 2, width: edge, height: edge))
+        }
+        context.restoreGState()
+    }
+}
+
+private final class CameraOverlayResizeHandle: NSView {
+    let corner: CameraResizeCorner
+    var onResize: ((NSPoint, Bool) -> Void)?
+    var highlighted = false { didSet { needsDisplay = true } }
+    private var startPoint = NSPoint.zero
+    init(corner: CameraResizeCorner) { self.corner = corner; super.init(frame: .zero) }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override var isOpaque: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .crosshair) }
+    override func mouseDown(with event: NSEvent) { startPoint = NSEvent.mouseLocation; onResize?(.zero, true) }
+    override func mouseDragged(with event: NSEvent) {
+        let point = NSEvent.mouseLocation
+        onResize?(NSPoint(x: point.x - startPoint.x, y: point.y - startPoint.y), false)
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        guard highlighted else { return }
+        NSColor(white: 0.12, alpha: 0.9).setFill()
+        NSBezierPath(ovalIn: bounds.insetBy(dx: 7, dy: 7)).fill()
+        NSColor(white: 1, alpha: 0.85).setStroke()
+        let ring = NSBezierPath(ovalIn: bounds.insetBy(dx: 7, dy: 7)); ring.lineWidth = 1.2; ring.stroke()
+    }
+}
+
+/// Its local preview is excluded with all Blurt chrome. Only camera pixels and this
+/// normalized placement are sent to the video compositor, never buttons or handles.
+final class CameraOverlayPanel: NSPanel {
+    var onClose: (() -> Void)?
+    var onLayoutChange: ((CGRect) -> Void)?
+    var onSizeChange: ((CGFloat) -> Void)?
+    private let surface = CameraOverlaySurface()
+    private let handles = CameraResizeCorner.allCases.map { CameraOverlayResizeHandle(corner: $0) }
+    private var closeButton: IconButton!
+    private var recordingRegion = CGRect.zero
+    private var sizeFraction: CGFloat = 0.24
+    private var savedOrigin: CGPoint?
+    private var dragAnchor = NSRect.zero
+    private var resizeAnchor = NSRect.zero
+    private var geometrySave: DispatchWorkItem?
+    var normalizedRect: CGRect {
+        guard recordingRegion.width > 0, recordingRegion.height > 0 else { return .zero }
+        let global = toCG(frame)
+        return CGRect(x: (global.minX - recordingRegion.minX) / recordingRegion.width,
+                      y: (global.minY - recordingRegion.minY) / recordingRegion.height,
+                      width: frame.width / recordingRegion.width, height: frame.height / recordingRegion.height)
+    }
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+
+    init() {
+        let config = recordConfig()
+        let requested = (config["narration_camera_size"] as? NSNumber)?.doubleValue ?? 0.24
+        sizeFraction = CGFloat(requested.isFinite ? min(0.6, max(0.12, requested)) : 0.24)
+        if let saved = config["narration_camera_position"] as? [String: Double],
+           let x = saved["x"], let y = saved["y"], x.isFinite, y.isFinite {
+            savedOrigin = CGPoint(x: min(1, max(0, x)), y: min(1, max(0, y)))
+        }
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 220, height: 220),
+                   styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        level = .statusBar
+        isFloatingPanel = true
+        hidesOnDeactivate = false
+        becomesKeyOnlyIfNeeded = true
+        isReleasedWhenClosed = false
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        sharingType = chromeSharing
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        appearance = NSAppearance(named: .darkAqua)
+        setAccessibilityLabel(L("摄像头人像，将显示在成片中；拖动移动，四角缩放", "Camera overlay included in recording; drag to move or resize from any corner"))
+        surface.frame = NSRect(origin: .zero, size: frame.size)
+        surface.autoresizingMask = [.width, .height]
+        contentView = surface
+        surface.onDrag = { [weak self] delta, begin in
+            guard let self = self, self.recordingRegion.width > 0 else { return }
+            if begin { self.dragAnchor = self.frame; return }
+            var next = self.dragAnchor.offsetBy(dx: delta.x, dy: delta.y)
+            let region = toNS(self.recordingRegion)
+            next.origin.x = max(region.minX, min(region.maxX - next.width, next.minX))
+            next.origin.y = max(region.minY, min(region.maxY - next.height, next.minY))
+            self.setFrame(self.alignedFrame(next), display: true)
+            self.changedLayout(sizeChanged: false)
+        }
+        surface.onHover = { [weak self] inside in
+            self?.closeButton.isHidden = !inside
+            self?.handles.forEach { $0.highlighted = inside }
+        }
+        closeButton = IconButton(symbol: "xmark", tip: L("关闭摄像头，继续录制屏幕", "Turn off camera and keep recording the screen"), target: self, action: #selector(hideCamera))
+        closeButton.isHidden = true
+        surface.addSubview(closeButton)
+        for handle in handles {
+            handle.setAccessibilityLabel(handle.corner.label + L(" · 拖动调整摄像头大小", " · Drag to resize camera"))
+            handle.onResize = { [weak self, weak handle] delta, begin in
+                guard let self = self, let handle = handle, self.recordingRegion.width > 0 else { return }
+                if begin { self.resizeAnchor = self.frame; return }
+                let next = handle.corner.resizedFrame(from: self.resizeAnchor, delta: delta, in: toNS(self.recordingRegion))
+                self.setFrame(self.alignedFrame(next), display: true)
+                self.layoutControls()
+                self.sizeFraction = self.frame.width / min(self.recordingRegion.width, self.recordingRegion.height)
+                self.changedLayout(sizeChanged: true)
+            }
+            surface.addSubview(handle)
+        }
+        layoutControls()
+    }
+
+    func setRegion(_ region: CGRect) {
+        guard !region.isNull, !region.isInfinite, region.width >= 2, region.height >= 2 else { return }
+        if recordingRegion == region { return }
+        let previous = recordingRegion.width > 0 ? normalizedRect.origin : savedOrigin
+        recordingRegion = region
+        let side = min(region.width, region.height) * sizeFraction
+        let margin = min(24, min(region.width, region.height) * 0.025)
+        let origin = previous ?? CGPoint(x: margin / region.width, y: (region.height - side - margin) / region.height)
+        let global = CGRect(x: region.minX + max(0, min(region.width - side, origin.x * region.width)),
+                            y: region.minY + max(0, min(region.height - side, origin.y * region.height)), width: side, height: side)
+        setFrame(alignedFrame(toNS(global)), display: true)
+        layoutControls()
+        // Selecting a different recording display rehomes the camera but does not
+        // replace the user's saved position until they explicitly move or resize it.
+        onLayoutChange?(normalizedRect)
+        onSizeChange?(sizeFraction)
+    }
+
+    func setImage(_ image: CGImage?) { surface.image = image }
+    func setShape(circular: Bool) { surface.circular = circular }
+    func setSizeFraction(_ fraction: CGFloat) {
+        guard fraction.isFinite else { return }
+        sizeFraction = min(0.6, max(0.12, fraction))
+        guard recordingRegion.width > 0 else { return }
+        let region = toNS(recordingRegion), side = min(region.width, region.height) * sizeFraction
+        let next = NSRect(x: max(region.minX, min(region.maxX - side, frame.midX - side / 2)),
+                          y: max(region.minY, min(region.maxY - side, frame.midY - side / 2)), width: side, height: side)
+        setFrame(alignedFrame(next), display: true)
+        layoutControls()
+        changedLayout(sizeChanged: true)
+    }
+
+    private func alignedFrame(_ proposed: NSRect) -> NSRect {
+        // NSWindow expands fractional sizes to whole points. Align before clamping
+        // so its actual square frame never crosses a cropped recording boundary.
+        let region = toNS(recordingRegion)
+        let minX = ceil(region.minX), minY = ceil(region.minY)
+        let maxX = floor(region.maxX), maxY = floor(region.maxY)
+        let side = max(1, min(floor(min(proposed.width, proposed.height)), maxX - minX, maxY - minY))
+        return NSRect(x: max(minX, min(maxX - side, proposed.minX.rounded())),
+                      y: max(minY, min(maxY - side, proposed.minY.rounded())), width: side, height: side)
+    }
+
+    private func layoutControls() {
+        let bounds = surface.bounds, handleSide = min(26, bounds.width / 3)
+        for handle in handles {
+            handle.frame = NSRect(x: handle.corner.isLeft ? 0 : bounds.width - handleSide,
+                                  y: handle.corner.isTop ? bounds.height - handleSide : 0,
+                                  width: handleSide, height: handleSide)
+        }
+        let closeSide = min(26, bounds.width / 3)
+        closeButton.frame = NSRect(x: (bounds.width - closeSide) / 2, y: bounds.height - closeSide - 7,
+                                   width: closeSide, height: closeSide)
+    }
+    private func changedLayout(sizeChanged: Bool) {
+        savedOrigin = normalizedRect.origin
+        onLayoutChange?(normalizedRect)
+        if sizeChanged { onSizeChange?(sizeFraction) }
+        geometrySave?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.saveGeometry() }
+        geometrySave = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+    }
+    private func saveGeometry() {
+        guard let origin = savedOrigin else { return }
+        setRecordConfig("narration_camera_position", ["x": Double(origin.x), "y": Double(origin.y)])
+        setRecordConfig("narration_camera_size", Double(sizeFraction))
+    }
+    @objc private func hideCamera() { orderOut(nil); onClose?() }
+    override func orderOut(_ sender: Any?) {
+        geometrySave?.cancel(); geometrySave = nil
+        saveGeometry()
+        super.orderOut(sender)
+    }
+    deinit { geometrySave?.cancel() }
+}
+
 // MARK: - Live recording preview (no writer, microphone, or saved frames)
 
 final class RecordingPreview: NSObject, SCStreamOutput, SCStreamDelegate {
@@ -2594,6 +3025,253 @@ final class RecordingPreview: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 }
 
+// MARK: - Camera capture
+
+final class CameraCaptureController: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    private let queue = DispatchQueue(label: "blurt.camera.capture", qos: .userInitiated)
+    private let lock = NSLock()
+    private var generation = 0
+    private var latestFrame: CVPixelBuffer?
+    private var session: AVCaptureSession?
+    private var output: AVCaptureVideoDataOutput?
+    private var device: AVCaptureDevice?
+    private var observers: [NSObjectProtocol] = []
+    private var activeGeneration = 0
+    private var pendingCompletion: ((Error?) -> Void)?
+    var onFailure: ((String) -> Void)?
+
+    static func devices() -> [AVCaptureDevice] {
+        if #available(macOS 14.0, *) {
+            return AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInWideAngleCamera, .external, .continuityCamera],
+                mediaType: .video, position: .unspecified).devices
+        }
+        return AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInWideAngleCamera, .externalUnknown],
+            mediaType: .video, position: .unspecified).devices
+    }
+
+    private func nextGeneration() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        generation += 1
+        latestFrame = nil
+        return generation
+    }
+
+    private func isCurrent(_ token: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return generation == token
+    }
+
+    func snapshot() -> CVPixelBuffer? {
+        lock.lock(); defer { lock.unlock() }
+        return latestFrame
+    }
+
+    // Success means a real frame is available, not merely that permission was granted.
+    func start(deviceID: String?, completion: @escaping (Error?) -> Void) {
+        let token = nextGeneration()
+        queue.async { [weak self] in
+            guard let self = self, self.isCurrent(token) else { return }
+            self.teardown()
+            self.activeGeneration = token
+            self.pendingCompletion = completion
+            switch AVCaptureDevice.authorizationStatus(for: .video) {
+            case .authorized: self.configure(deviceID: deviceID, token: token)
+            case .notDetermined:
+                AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                    guard let self = self else { return }
+                    self.queue.async {
+                        guard self.isCurrent(token) else { return }
+                        if granted { self.configure(deviceID: deviceID, token: token) }
+                        else { self.fail(L("请在系统设置中允许 Blurt 使用摄像头。", "Allow Blurt to use the camera in System Settings."), token: token) }
+                    }
+                }
+            default: self.fail(L("请在系统设置中允许 Blurt 使用摄像头。", "Allow Blurt to use the camera in System Settings."), token: token)
+            }
+        }
+    }
+
+    func stop() {
+        _ = nextGeneration() // Invalidates permission/start callbacks and removes the image immediately.
+        queue.async { self.teardown() } // Keep teardown off the main thread even if the owner releases us.
+    }
+
+    private func configure(deviceID: String?, token: Int) {
+        guard isCurrent(token) else { return }
+        let available = Self.devices()
+        let selected = deviceID.flatMap { id in available.first { $0.uniqueID == id } }
+            ?? (deviceID == nil ? available.first : nil)
+        guard let selected = selected, selected.isConnected else {
+            fail(L("未找到所选摄像头，请重新选择。", "The selected camera is unavailable. Choose another camera."), token: token); return
+        }
+        do {
+            let capture = AVCaptureSession()
+            capture.beginConfiguration()
+            if capture.canSetSessionPreset(.hd1280x720) { capture.sessionPreset = .hd1280x720 }
+            let input = try AVCaptureDeviceInput(device: selected)
+            guard capture.canAddInput(input) else { throw NSError(domain: "blurt.camera", code: 1) }
+            capture.addInput(input)
+            let video = AVCaptureVideoDataOutput()
+            video.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+            video.alwaysDiscardsLateVideoFrames = true
+            video.setSampleBufferDelegate(self, queue: queue)
+            guard capture.canAddOutput(video) else { throw NSError(domain: "blurt.camera", code: 2) }
+            capture.addOutput(video)
+            if let connection = video.connection(with: .video), connection.isVideoMirroringSupported {
+                connection.automaticallyAdjustsVideoMirroring = false
+                connection.isVideoMirrored = false // Preview and export apply the user's mirror setting once.
+            }
+            capture.commitConfiguration()
+            guard isCurrent(token) else { return }
+            session = capture; output = video; device = selected
+            let center = NotificationCenter.default
+            observers.append(center.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: capture, queue: nil) { [weak self] note in
+                let message = (note.userInfo?[AVCaptureSessionErrorKey] as? Error)?.localizedDescription
+                    ?? L("摄像头已停止，请重新打开。", "The camera stopped. Turn it on again.")
+                self?.queue.async { [weak self] in self?.fail(message, token: token) }
+            })
+            observers.append(center.addObserver(forName: AVCaptureSession.wasInterruptedNotification, object: capture, queue: nil) { [weak self] _ in
+                self?.queue.async { [weak self] in self?.fail(L("摄像头暂时无法使用，请重新打开。", "The camera is unavailable. Turn it on again."), token: token) }
+            })
+            observers.append(center.addObserver(forName: AVCaptureDevice.wasDisconnectedNotification, object: selected, queue: nil) { [weak self] _ in
+                self?.queue.async { [weak self] in self?.fail(L("摄像头已断开连接，请重新选择。", "The camera disconnected. Choose another camera."), token: token) }
+            })
+            capture.startRunning()
+            guard isCurrent(token) else { teardown(); return }
+            guard capture.isRunning else {
+                fail(L("摄像头无法启动，可能正被其他应用使用。", "The camera could not start. It may be in use by another app."), token: token); return
+            }
+            queue.asyncAfter(deadline: .now() + 8) { [weak self] in
+                guard let self = self, self.isCurrent(token), self.pendingCompletion != nil else { return }
+                self.fail(L("摄像头没有返回画面，请检查连接或重新选择。", "No camera image was received. Check its connection or choose another camera."), token: token)
+            }
+        } catch {
+            fail(error.localizedDescription, token: token)
+        }
+    }
+
+    private func teardown() {
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        observers.removeAll()
+        output?.setSampleBufferDelegate(nil, queue: nil)
+        if session?.isRunning == true { session?.stopRunning() }
+        session = nil; output = nil; device = nil; pendingCompletion = nil
+    }
+
+    private func fail(_ message: String, token: Int) {
+        guard isCurrent(token) else { return }
+        lock.lock(); latestFrame = nil; lock.unlock()
+        let completion = pendingCompletion
+        teardown()
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.isCurrent(token) else { return }
+            let error = NSError(domain: "blurt.camera", code: 3, userInfo: [NSLocalizedDescriptionKey: message])
+            if let completion = completion { completion(error) } else { self.onFailure?(message) }
+        }
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        let token = activeGeneration
+        guard self.output === output, sampleBuffer.isValid, isCurrent(token),
+              let pixels = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        lock.lock()
+        if generation == token { latestFrame = pixels }
+        lock.unlock()
+        if let completion = pendingCompletion {
+            pendingCompletion = nil
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, self.isCurrent(token), self.snapshot() != nil else { return }
+                completion(nil)
+            }
+        }
+    }
+
+    deinit {
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        output?.setSampleBufferDelegate(nil, queue: nil)
+        if session?.isRunning == true { session?.stopRunning() }
+    }
+}
+
+// MARK: - Camera compositing
+
+struct CameraCompositeState {
+    let pixelBuffer: CVPixelBuffer
+    // Relative to the selected recording area; origin is its top-left corner.
+    let normalizedRect: CGRect
+    let circular: Bool
+    let mirrored: Bool
+}
+
+final class CameraCompositor {
+    private let context = CIContext()
+    private var pool: CVPixelBufferPool?
+    private var poolSize = CGSize.zero
+
+    // Shared by the setup preview and the actual MP4 writer: chrome is never composited.
+    static func compositedImage(screen: CIImage, state: CameraCompositeState) -> CIImage {
+        let bounds = screen.extent
+        let n = state.normalizedRect
+        guard [n.minX, n.minY, n.width, n.height].allSatisfy({ $0.isFinite }),
+              n.width > 0, n.height > 0, bounds.width > 0, bounds.height > 0 else { return screen }
+        let rect = CGRect(x: bounds.minX + n.minX * bounds.width,
+                          y: bounds.minY + (1 - n.maxY) * bounds.height,
+                          width: n.width * bounds.width, height: n.height * bounds.height)
+        guard rect.intersects(bounds) else { return screen }
+        var camera = CIImage(cvPixelBuffer: state.pixelBuffer)
+        let source = camera.extent
+        guard source.width > 0, source.height > 0 else { return screen }
+        camera = camera.transformed(by: CGAffineTransform(translationX: -source.minX, y: -source.minY))
+        if state.mirrored {
+            camera = camera.transformed(by: CGAffineTransform(a: -1, b: 0, c: 0, d: 1, tx: source.width, ty: 0))
+        }
+        let scale = max(rect.width / source.width, rect.height / source.height)
+        camera = camera.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        camera = camera.transformed(by: CGAffineTransform(translationX: rect.midX - camera.extent.midX,
+                                                         y: rect.midY - camera.extent.midY)).cropped(to: rect)
+        if state.circular {
+            // A grayscale radial mask has a one-output-pixel antialiased edge. UI always uses a square rect.
+            let radius = min(rect.width, rect.height) / 2
+            let mask = CIFilter(name: "CIRadialGradient", parameters: [
+                "inputCenter": CIVector(x: rect.midX, y: rect.midY),
+                "inputRadius0": max(0, radius - 0.75), "inputRadius1": radius + 0.25,
+                "inputColor0": CIColor(red: 1, green: 1, blue: 1, alpha: 1),
+                "inputColor1": CIColor(red: 0, green: 0, blue: 0, alpha: 1),
+            ])!.outputImage!.cropped(to: rect)
+            camera = camera.applyingFilter("CIBlendWithMask", parameters: [
+                kCIInputBackgroundImageKey: CIImage(color: CIColor.clear).cropped(to: rect),
+                kCIInputMaskImageKey: mask,
+            ])
+        }
+        return camera.composited(over: screen).cropped(to: bounds)
+    }
+
+    func compositedBuffer(screen: CVPixelBuffer, state: CameraCompositeState) -> CVPixelBuffer? {
+        let width = CVPixelBufferGetWidth(screen), height = CVPixelBufferGetHeight(screen)
+        let size = CGSize(width: width, height: height)
+        if pool == nil || poolSize != size {
+            pool = nil
+            let attributes: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: height,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+            ]
+            guard CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &pool) == kCVReturnSuccess else { return nil }
+            poolSize = size
+        }
+        guard let pool = pool else { return nil }
+        var destination: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &destination) == kCVReturnSuccess,
+              let destination = destination else { return nil }
+        // Keep the screen's primaries, transfer function, color-space metadata and display dimensions.
+        CVBufferPropagateAttachments(screen, destination)
+        let image = Self.compositedImage(screen: CIImage(cvPixelBuffer: screen), state: state)
+        let colorSpace = CVImageBufferGetColorSpace(screen)?.takeUnretainedValue() ?? CGColorSpace(name: CGColorSpace.sRGB)!
+        context.render(image, to: destination, bounds: image.extent, colorSpace: colorSpace)
+        return destination
+    }
+}
+
 // MARK: - Recorder
 
 func audioInputDevices() -> [AVCaptureDevice] {
@@ -2638,6 +3316,14 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudio
     var onPrompterChanged: ((Bool) -> Void)?
     var onEditNarration: (() -> Void)?
     var onPrompterDisplayChanged: ((CGDirectDisplayID?) -> Void)?
+    var onWillStop: ((Bool) -> Void)?
+    private var willStopNotified = false
+    // Install once before prepare. The closure snapshots thread-safe camera and placement state.
+    var cameraFrameProvider: (() -> CameraCompositeState?)?
+    private let cameraCompositor = CameraCompositor()
+    private var latestScreenSample: CMSampleBuffer?
+    private var cameraRefresh: DispatchSourceTimer?
+    private var lastRawVideo = CMTime.invalid
 
     init(region: CGRect) {
         self.region = region
@@ -2904,7 +3590,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudio
         if type == .screen {
             guard let att = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
                   let raw = att.first?[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete else { return }
-            handleVideo(sb)
+            handleScreenVideo(sb)
         } else {
             handleAudio(sb)
         }
@@ -2925,6 +3611,14 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudio
         if let o = out { handleAudio(o) }
     }
 
+    func handleScreenVideo(_ sample: CMSampleBuffer) {
+        // Always cache the original screen, including while paused. Re-compositing an already
+        // composited image would leave a ghost when the camera moves, hides or disconnects.
+        latestScreenSample = sample
+        ensureCameraRefresh()
+        handleVideo(sample)
+    }
+
     func handleVideo(_ sb: CMSampleBuffer) {
         guard !stopping, captureError == nil else { return }
         if !started {
@@ -2939,11 +3633,66 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudio
             DispatchQueue.main.async { emit(["event": "recording"]) }
         }
         if isPaused { return }
-        guard let s = adjusted(sb), vIn.isReadyForMoreMediaData else { return }
+        let rawTime = CMSampleBufferGetPresentationTimeStamp(sb)
+        let frameInterval = 1.0 / Double(max(1, opts.fps))
+        if cameraFrameProvider != nil, lastRawVideo.isValid,
+           CMTimeGetSeconds(CMTimeSubtract(rawTime, lastRawVideo)) < frameInterval * 0.85 { return }
+        guard let adjustedSample = adjusted(sb), vIn.isReadyForMoreMediaData else { return }
+        let adjustedTime = CMSampleBufferGetPresentationTimeStamp(adjustedSample)
+        guard !lastVideo.isValid || CMTimeCompare(adjustedTime, lastVideo) > 0 else { return }
+        var s = adjustedSample
+        if let state = cameraFrameProvider?() {
+            guard let screen = CMSampleBufferGetImageBuffer(adjustedSample),
+                  let pixels = cameraCompositor.compositedBuffer(screen: screen, state: state),
+                  let composed = sampleReplacingImage(adjustedSample, pixels: pixels) else {
+                captureError = NSError(domain: "blurt.camera", code: 4, userInfo: [NSLocalizedDescriptionKey:
+                    L("无法合成摄像头画面，录制已停止。", "Could not composite the camera image. Recording stopped.")])
+                DispatchQueue.main.async { self.stop() }
+                return
+            }
+            s = composed
+        }
         if vIn.append(s) {
             frames += 1
             lastVideo = CMSampleBufferGetPresentationTimeStamp(s)
+            lastRawVideo = rawTime
         } else { failWriting() }
+    }
+
+    private func sampleReplacingImage(_ sample: CMSampleBuffer, pixels: CVPixelBuffer) -> CMSampleBuffer? {
+        var format: CMVideoFormatDescription?
+        guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: pixels,
+                formatDescriptionOut: &format) == noErr, let format = format else { return nil }
+        var timing = CMSampleTimingInfo(duration: CMSampleBufferGetDuration(sample),
+            presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sample),
+            decodeTimeStamp: CMSampleBufferGetDecodeTimeStamp(sample))
+        var result: CMSampleBuffer?
+        guard CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: pixels,
+                formatDescription: format, sampleTiming: &timing, sampleBufferOut: &result) == noErr else { return nil }
+        return result
+    }
+
+    private func ensureCameraRefresh() {
+        guard cameraFrameProvider != nil, cameraRefresh == nil, !stopping else { return }
+        let timer = DispatchSource.makeTimerSource(queue: q)
+        timer.schedule(deadline: .now() + 1.0 / Double(max(1, opts.fps)), repeating: 1.0 / Double(max(1, opts.fps)), leeway: .milliseconds(2))
+        timer.setEventHandler { [weak self] in self?.refreshCameraFrame() }
+        cameraRefresh = timer
+        timer.resume()
+    }
+
+    // ScreenCaptureKit suppresses unchanged screen frames. Camera motion must keep advancing
+    // even over a static slide; the host clock shares ScreenCaptureKit's timestamp domain.
+    func refreshCameraFrame() {
+        guard !stopping, !isPaused, started, cameraFrameProvider != nil,
+              let screen = latestScreenSample else { return }
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: CMTimeScale(max(1, opts.fps))),
+            presentationTimeStamp: hostNow(), decodeTimeStamp: .invalid)
+        var repeated: CMSampleBuffer?
+        guard CMSampleBufferCreateCopyWithNewTiming(allocator: nil, sampleBuffer: screen,
+                sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleBufferOut: &repeated) == noErr,
+              let repeated = repeated else { return }
+        handleVideo(repeated)
     }
 
     func handleAudio(_ sb: CMSampleBuffer) {
@@ -2999,18 +3748,23 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudio
         guard !stopping else { return }
         if startingCapture {
             pendingStop = (discard, restart)
+            if !restart { notifyWillStop(restart: false) }
             cleanupChrome()
             return
         }
         self.discard = discard
         let endAt = CMTimeSubtract(pausedAt ?? hostNow(), offset)
         stopping = true
+        notifyWillStop(restart: restart)
         cleanupChrome()
         log("stop")
         try? events?.close()
         captureSession?.stopRunning()
         let finish = {
             self.q.async {
+                self.cameraRefresh?.cancel()
+                self.cameraRefresh = nil
+                self.latestScreenSample = nil
                 guard self.started else {
                     self.writer?.cancelWriting()
                     DispatchQueue.main.async {
@@ -3053,6 +3807,13 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudio
             }
         }
         if let s = stream { s.stopCapture { _ in finish() } } else { finish() }
+    }
+
+    private func notifyWillStop(restart: Bool) {
+        guard !willStopNotified else { return }
+        willStopNotified = true
+        if Thread.isMainThread { onWillStop?(restart) }
+        else { DispatchQueue.main.async { self.onWillStop?(restart) } }
     }
 }
 
@@ -3207,6 +3968,33 @@ func shq(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'
 
 // MARK: - App
 
+/// A stable, locked bridge between the main-thread camera controls and the writer queue.
+/// Window coordinates and AppKit state never escape onto the capture queue.
+final class NarrationCameraFeed {
+    let capture = CameraCaptureController()
+    private let lock = NSLock()
+    private var enabled = false
+    private var rect = CGRect.zero
+    private var circular = true
+    private var mirrored = true
+
+    func update(enabled: Bool, rect: CGRect, circular: Bool, mirrored: Bool) {
+        lock.lock()
+        self.enabled = enabled
+        self.rect = rect
+        self.circular = circular
+        self.mirrored = mirrored
+        lock.unlock()
+    }
+
+    func snapshot() -> CameraCompositeState? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard enabled, rect.width > 0, rect.height > 0, let buffer = capture.snapshot() else { return nil }
+        return CameraCompositeState(pixelBuffer: buffer, normalizedRect: rect, circular: circular, mirrored: mirrored)
+    }
+}
+
 final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var picker: PickerController?
     var rec: Recorder?
@@ -3222,6 +4010,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var narrationLocalRegion: CGRect?
     var narrationFullDisplay = false
     var narrationScreenObserver: NSObjectProtocol?
+    var narrationCameraFeed: NarrationCameraFeed?
+    var narrationCameraPanel: CameraOverlayPanel?
+    var narrationCameraTimer: Timer?
+    var narrationCameraGeneration = 0
+    var narrationCameraDeviceID: String?
+    var narrationCameraDeviceObservers: [NSObjectProtocol] = []
+    var narrationCameraReady = false
+    var narrationCameraStarting = false
+    var narrationScreenPreviewImage: NSImage?
+    private let narrationCameraContext = CIContext(options: [.cacheIntermediates: false])
     var standalonePrompterSetup: StandalonePrompterController?
     var standalonePrompter: TeleprompterPanel?
     var standalonePrompterTimer: Timer?
@@ -3327,6 +4125,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         opts.lastRegion = region
         let r = Recorder(region: region)
         if opts.narrationScript != nil {
+            if let feed = narrationCameraFeed { r.cameraFrameProvider = { [weak feed] in feed?.snapshot() } }
+            r.onWillStop = { [weak self] restarting in if !restarting { self?.closeNarrationCamera() } }
             r.onEditNarration = { [weak self] in self?.showNarrationControls() }
             r.onPrompterChanged = { [weak self] enabled in self?.narrationSetup?.setPrompterEnabled(enabled) }
             r.onPrompterDisplayChanged = { [weak self] id in
@@ -3464,6 +4264,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         closeStandalonePrompter()
+        closeNarrationCamera()
         stopNarrationPreview()
         closePreviewPrompter()
         narrationSetup?.cancel()   // Flush any pending draft edit before the app exits.
@@ -3928,6 +4729,19 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let setup = NarrationSetupController()
         narrationSetup = setup
         setup.onUseStandalone = { [weak self] in self?.mStandalonePrompter() }
+        setup.onCameraChange = { [weak self] enabled, deviceID, circular, mirrored in
+            self?.updateNarrationCamera(enabled: enabled, deviceID: deviceID, circular: circular, mirrored: mirrored)
+        }
+        setup.onCameraSizeChange = { [weak self] fraction in
+            self?.narrationCameraPanel?.setSizeFraction(fraction)
+            self?.updateNarrationCameraLayout()
+        }
+        refreshNarrationCameraDevices()
+        for name in [AVCaptureDevice.wasConnectedNotification, AVCaptureDevice.wasDisconnectedNotification] {
+            narrationCameraDeviceObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.refreshNarrationCameraDevices()
+            })
+        }
         setup.onCancel = { [weak self] in
             guard let self = self, self.rec == nil else { return }
             self.closeNarrationControls()
@@ -3970,6 +4784,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         narrationPrompterDisplayID = TeleprompterPanel.preferredDisplayID(fallback: narrationRecordingDisplayID)
         refreshNarrationDisplays()
         updatePreviewPrompter(script: setup.scriptValue, enabled: setup.prompterEnabled)
+        updateNarrationCamera(enabled: setup.cameraEnabled, deviceID: setup.cameraDeviceID,
+                              circular: setup.cameraCircular, mirrored: setup.cameraMirrored)
     }
 
     @objc func mCancelNarration() { narrationSetup?.cancel() }
@@ -4042,6 +4858,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                                             "width": local.width, "height": local.height, "full_screen": region == display])
         }
         narrationSetup?.setRegion(region, label: "\(screen.localizedName) · \(Int(region.width)) × \(Int(region.height))")
+        narrationCameraPanel?.setRegion(region)
+        updateNarrationCameraLayout()
         refreshNarrationDisplays()
         startNarrationPreview(region)
     }
@@ -4075,6 +4893,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stopNarrationPreview()
         guard let screen = narrationScreen(narrationRecordingDisplayID) else {
             narrationRegion = nil
+            narrationCameraPanel?.orderOut(nil)
             setup.setRegion(.zero, label: L("录制屏幕已断开", "Recording display disconnected"))
             setup.setPreviewStatus(L("请选择一块已连接的录制屏幕。", "Choose a connected display to record."), error: true)
             refreshNarrationDisplays()
@@ -4092,6 +4911,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stopNarrationPreview()
         setup.hideForRegionSelection()
         previewPrompter?.orderOut(nil)
+        narrationCameraPanel?.orderOut(nil)
         let p = PickerController()
         p.selectionOnly = true
         p.targetDisplayID = narrationRecordingDisplayID
@@ -4104,6 +4924,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let region = region { self.setNarrationRegion(region) }
             else if let previous = self.narrationRegion { self.startNarrationPreview(previous) }
             self.updatePreviewPrompter(script: setup.scriptValue, enabled: setup.prompterEnabled)
+            self.refreshNarrationCamera()
         }
         picker = p
         registerHotkey(.pickEnter, key: kVK_Return, mods: 0)
@@ -4123,10 +4944,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         narrationPreview = preview
         preview.onImage = { [weak self, weak preview] image in
             guard let self = self, let preview = preview, self.narrationPreview === preview else { return }
-            self.narrationSetup?.setPreview(image)
+            self.narrationScreenPreviewImage = image
+            self.renderNarrationPreview()
         }
         preview.onError = { [weak self, weak preview] message in
             guard let self = self, let preview = preview, self.narrationPreview === preview else { return }
+            self.narrationScreenPreviewImage = nil
             self.narrationSetup?.setPreviewStatus(message, error: true)
         }
         preview.start(region: region)
@@ -4135,6 +4958,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func stopNarrationPreview() {
         narrationPreview?.stop()
         narrationPreview = nil
+        narrationScreenPreviewImage = nil
     }
 
     func updatePreviewPrompter(script: String, enabled: Bool) {
@@ -4172,6 +4996,139 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         previewPrompter = nil
     }
 
+    func refreshNarrationCameraDevices() {
+        guard let setup = narrationSetup else { return }
+        setup.setCameraDevices(CameraCaptureController.devices().map { (id: $0.uniqueID, name: $0.localizedName) }, selected: setup.cameraDeviceID)
+    }
+
+    func updateNarrationCamera(enabled: Bool, deviceID: String?, circular: Bool, mirrored: Bool) {
+        guard let setup = narrationSetup else { return }
+        if narrationCameraFeed == nil { narrationCameraFeed = NarrationCameraFeed() }
+        guard let feed = narrationCameraFeed else { return }
+        if !enabled {
+            narrationCameraGeneration += 1
+            narrationCameraReady = false
+            narrationCameraStarting = false
+            feed.update(enabled: false, rect: .zero, circular: circular, mirrored: mirrored)
+            feed.capture.stop()
+            narrationCameraPanel?.orderOut(nil)
+            narrationCameraPanel?.setImage(nil)
+            narrationCameraTimer?.invalidate()
+            narrationCameraTimer = nil
+            setup.setCameraStatus(L("摄像头已关闭", "Camera off"), ready: false)
+            renderNarrationPreview()
+            return
+        }
+        guard let region = narrationRegion else { return }
+        if narrationCameraPanel == nil {
+            let panel = CameraOverlayPanel()
+            panel.onClose = { [weak self] in self?.narrationSetup?.setCameraEnabled(false) }
+            panel.onLayoutChange = { [weak self] _ in self?.updateNarrationCameraLayout() }
+            panel.onSizeChange = { [weak self] fraction in self?.narrationSetup?.setCameraSize(fraction) }
+            narrationCameraPanel = panel
+        }
+        narrationCameraPanel?.setRegion(region)
+        narrationCameraPanel?.setShape(circular: circular)
+        updateNarrationCameraLayout()
+        if narrationCameraTimer == nil {
+            let timer = Timer(timeInterval: 1.0 / 20.0, repeats: true) { [weak self] _ in self?.refreshNarrationCamera() }
+            RunLoop.main.add(timer, forMode: .common)
+            narrationCameraTimer = timer
+        }
+        if narrationCameraDeviceID == deviceID && (narrationCameraStarting || narrationCameraReady) {
+            refreshNarrationCamera()
+            return
+        }
+        narrationCameraGeneration += 1
+        let generation = narrationCameraGeneration
+        narrationCameraDeviceID = deviceID
+        narrationCameraReady = false
+        narrationCameraStarting = true
+        feed.update(enabled: false, rect: .zero, circular: circular, mirrored: mirrored)
+        narrationCameraPanel?.setImage(nil)
+        narrationCameraPanel?.orderOut(nil)
+        setup.setCameraStatus(L("正在连接摄像头…", "Connecting to your camera…"), ready: false)
+        feed.capture.onFailure = { [weak self, weak feed] message in
+            guard let self = self, self.narrationCameraFeed === feed,
+                  self.narrationCameraGeneration == generation else { return }
+            self.narrationCameraReady = false
+            self.narrationCameraStarting = false
+            self.narrationCameraPanel?.setImage(nil)
+            self.narrationCameraPanel?.orderOut(nil)
+            self.updateNarrationCameraLayout()
+            self.narrationSetup?.setCameraStatus(message, ready: false)
+            if self.rec != nil { toast(message) }
+        }
+        feed.capture.start(deviceID: deviceID) { [weak self, weak feed] error in
+            guard let self = self, self.narrationCameraFeed === feed,
+                  self.narrationCameraGeneration == generation,
+                  self.narrationSetup?.cameraEnabled == true else { return }
+            self.narrationCameraStarting = false
+            self.narrationCameraReady = error == nil
+            if let error = error {
+                self.narrationSetup?.setCameraStatus(error.localizedDescription, ready: false)
+            } else {
+                self.narrationSetup?.setCameraStatus(L("摄像头已就绪 · 将录入视频", "Camera ready · included in your video"), ready: true)
+            }
+            self.updateNarrationCameraLayout()
+            self.refreshNarrationCamera()
+        }
+    }
+
+    func updateNarrationCameraLayout() {
+        guard let setup = narrationSetup else { return }
+        narrationCameraFeed?.update(enabled: setup.cameraEnabled && narrationCameraReady,
+                                    rect: narrationCameraPanel?.normalizedRect ?? .zero,
+                                    circular: setup.cameraCircular, mirrored: setup.cameraMirrored)
+    }
+
+    func refreshNarrationCamera() {
+        guard let setup = narrationSetup else { return }
+        if setup.cameraEnabled, narrationCameraReady, let state = narrationCameraFeed?.snapshot(),
+           let panel = narrationCameraPanel {
+            var image = CIImage(cvPixelBuffer: state.pixelBuffer)
+            if state.mirrored { image = image.oriented(.upMirrored) }
+            panel.setImage(narrationCameraContext.createCGImage(image, from: image.extent))
+            if picker == nil && narrationRegion != nil && !panel.isVisible { panel.orderFrontRegardless() }
+        }
+        renderNarrationPreview()
+    }
+
+    func renderNarrationPreview() {
+        guard narrationPreview != nil, let base = narrationScreenPreviewImage else { return }
+        guard let state = narrationCameraFeed?.snapshot(),
+              let cg = base.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            narrationSetup?.setPreview(base)
+            return
+        }
+        let screen = CIImage(cgImage: cg)
+        let composed = CameraCompositor.compositedImage(screen: screen, state: state)
+        if let image = narrationCameraContext.createCGImage(composed, from: screen.extent) {
+            narrationSetup?.setPreview(NSImage(cgImage: image, size: base.size))
+        } else { narrationSetup?.setPreview(base) }
+    }
+
+    func closeNarrationCamera() {
+        narrationCameraDeviceObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        narrationCameraDeviceObservers.removeAll()
+        narrationCameraGeneration += 1
+        narrationCameraTimer?.invalidate()
+        narrationCameraTimer = nil
+        narrationCameraFeed?.update(enabled: false, rect: .zero, circular: true, mirrored: true)
+        narrationCameraFeed?.capture.onFailure = nil
+        narrationCameraFeed?.capture.stop()
+        narrationCameraFeed = nil
+        narrationCameraPanel?.onClose = nil
+        narrationCameraPanel?.onLayoutChange = nil
+        narrationCameraPanel?.onSizeChange = nil
+        narrationCameraPanel?.setImage(nil)
+        narrationCameraPanel?.orderOut(nil)
+        narrationCameraPanel = nil
+        narrationCameraReady = false
+        narrationCameraStarting = false
+        narrationCameraDeviceID = nil
+    }
+
     func closeNarrationControls() {
         if let observer = narrationScreenObserver { NotificationCenter.default.removeObserver(observer) }
         narrationScreenObserver = nil
@@ -4183,10 +5140,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         stopNarrationPreview()
         closePreviewPrompter()
+        closeNarrationCamera()
         let setup = narrationSetup
         narrationSetup = nil
         setup?.onCancel = nil
         setup?.onPrompterChange = nil
+        setup?.onCameraChange = nil
+        setup?.onCameraSizeChange = nil
         setup?.onHide = nil
         setup?.setRecordingMode(false)
         setup?.cancel()
@@ -4198,6 +5158,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func startNarrationRecording(region: CGRect, script: String, enabled: Bool, microphone: Bool) {
         guard rec == nil, picker == nil, let setup = narrationSetup else { return }
+        guard !setup.cameraEnabled || (narrationCameraReady && narrationCameraFeed?.snapshot() != nil) else { return }
         guard let screen = narrationScreen(narrationRecordingDisplayID),
               narrationRegion == region, toCG(screen.frame).contains(region) else {
             narrationScreensChanged()
